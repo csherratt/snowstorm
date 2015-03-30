@@ -120,13 +120,17 @@ struct Channel<T> {
 }
 
 pub struct Sender<T> {
-    buffer: Vec<T>,
     channel: Arc<Channel<T>>,
+    buffer: Vec<T>,
     write: WritePtr<T>
 }
 
 impl<T: Send+Sync> Sender<T> {
     pub fn send(&mut self, value: T) {
+        if self.buffer.capacity() == 0 {
+            let size = if mem::size_of::<T>() > 4096 { 1 } else { 4096 / mem::size_of::<T>() };
+            self.buffer.reserve(size);
+        }
         self.buffer.push(value);
         if self.buffer.capacity() == self.buffer.len() {
             self.flush()
@@ -141,11 +145,59 @@ impl<T: Send+Sync> Sender<T> {
     }
 }
 
+pub struct Receiver<T> {
+    channel: Arc<Channel<T>>,
+    current: *const Block<T>,
+    index: usize
+}
+
+impl<T: Send+Sync> Receiver<T> {
+    pub fn recv(&mut self) -> Option<&T> {
+        loop {
+            if self.current.is_null() {
+                unsafe { self.current = mem::transmute_copy(&self.channel.head); };
+            }
+
+            if self.current.is_null() {
+                return None;
+            } else {
+                unsafe {
+                    if (*self.current).data.len() <= self.index {
+                        let next = (*self.current).next.load(Ordering::Relaxed);
+                        self.index = 0;
+                        self.current = next;
+                    } else {
+                        let i = self.index;
+                        self.index += 1;
+                        return Some(&(*self.current).data[i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
+    let channel = Arc::new(Channel {
+        head: AtomicPtr::new(ptr::null_mut())
+    });
+    (Sender {
+        buffer: Vec::new(),
+        channel: channel.clone(),
+        write: WritePtr::from_channel(&channel)
+    },
+    Receiver {
+        channel: channel,
+        current: ptr::null(),
+        index: 0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::*;
     use std::sync::Arc;
-    use channel::{Block, WritePtr};
+    use channel::{Block, WritePtr, channel};
 
     #[test]
     fn write_ptr_write() {
@@ -228,5 +280,19 @@ mod tests {
         assert_eq!(v.load(Ordering::SeqCst), 0);
         drop(a);
         assert_eq!(v.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn channel_send() {
+        let (mut s, mut r) = channel();
+        for i in (0..1000) {
+            s.send(i);
+        }
+
+        s.flush();
+
+        for i in (0..1000) {
+            assert_eq!(r.recv(), Some(&i));
+        }
     }
 }
