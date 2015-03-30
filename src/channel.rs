@@ -126,9 +126,10 @@ pub struct Sender<T> {
 }
 
 impl<T: Send+Sync> Sender<T> {
+    #[inline]
     pub fn send(&mut self, value: T) {
         if self.buffer.capacity() == 0 {
-            let size = if mem::size_of::<T>() > 4096 { 1 } else { 4096 / mem::size_of::<T>() };
+            let size = if mem::size_of::<T>() > 2048 { 1 } else { 2048 / mem::size_of::<T>() };
             self.buffer.reserve(size);
         }
         self.buffer.push(value);
@@ -224,6 +225,7 @@ fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
 mod tests {
     use std::sync::atomic::*;
     use std::sync::Arc;
+    use test::{Bencher, black_box};
     use channel::{Block, WritePtr, channel};
 
     #[test]
@@ -379,5 +381,31 @@ mod tests {
             assert_eq!(r.recv(), Some(&i));
         }
 
+    }
+
+    #[bench]
+    fn bench_channel_send(bench: &mut Bencher) {
+        let (mut s, _) = channel();
+
+        let mut i = 0;
+
+        bench.iter(|| {
+            s.send(i);
+            i += 1;
+        });
+    }
+
+    #[bench]
+    fn bench_channel_recv(bench: &mut Bencher) {
+        let (mut s, mut r) = channel();
+
+        for i in (0..1_000_000) {
+            s.send(i);
+        }
+        s.flush();
+
+        bench.iter(|| {
+            black_box(r.recv());
+        });
     }
 }

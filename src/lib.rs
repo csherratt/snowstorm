@@ -1,4 +1,6 @@
+#![feature(unsafe_destructor, collections, test)]
 
-#![feature(unsafe_destructor, collections)]
+#[cfg(test)]
+extern crate test;
 
 pub mod channel;
