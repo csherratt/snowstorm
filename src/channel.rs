@@ -1,4 +1,3 @@
-
 use std::sync::atomic::*;
 use std::ptr;
 use std::mem;
@@ -23,6 +22,20 @@ impl<T: Send+Sync> Block<T> {
         } else {
             let n: &Block<T> = unsafe { mem::transmute_copy(&next) };
             Some(n)
+        }
+    }
+}
+
+#[unsafe_destructor]
+impl<T> Drop for Block<T> {
+    fn drop(&mut self) {
+        let mut next = self.next.swap(ptr::null_mut(), Ordering::Relaxed);
+        // This avoids recursing more then one level
+        while !next.is_null() {
+            unsafe {
+                let next_block: Box<Block<T>> = mem::transmute_copy(&next);
+                next = next_block.next.swap(ptr::null_mut(), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -76,7 +89,7 @@ impl<'a, T: Send+Sync> WritePtr<'a, T> {
     }
 
     /// Seek the current tail, and write block b to it. If that
-    /// fails try again until it does.
+    /// fails try again until it is written successfully.
     ///
     /// This returns the WritePtr of that block.
     fn append(mut self, mut b: Box<Block<T>>) -> WritePtr<'a, T> {
@@ -92,18 +105,20 @@ impl<'a, T: Send+Sync> WritePtr<'a, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::*;
+    use std::sync::Arc;
     use channel::{Block, WritePtr};
 
     #[test]
     fn write_ptr_write() {
         let mut a = Box::new(Block::new(Box::new([1i32])));
-        let mut b = Box::new(Block::new(Box::new([2i32])));
-        let mut c = Box::new(Block::new(Box::new([3i32])));
+        let b = Box::new(Block::new(Box::new([2i32])));
+        let c = Box::new(Block::new(Box::new([3i32])));
 
         {
             let ptr = WritePtr::from_block(&mut a);
             assert!(ptr.write(b).is_none());
-            let c = ptr.write(c).unwrap();
+            ptr.write(c).unwrap();
         }
 
         assert!(*a.data == vec!(1)[..]);
@@ -115,8 +130,8 @@ mod tests {
     #[test]
     fn write_ptr_write_tail() {
         let mut a = Box::new(Block::new(Box::new([1i32])));
-        let mut b = Box::new(Block::new(Box::new([2i32])));
-        let mut c = Box::new(Block::new(Box::new([3i32])));
+        let b = Box::new(Block::new(Box::new([2i32])));
+        let c = Box::new(Block::new(Box::new([3i32])));
 
         {
             let mut ptr = WritePtr::from_block(&mut a);
@@ -133,16 +148,43 @@ mod tests {
     #[test]
     fn write_ptr_append() {
         let mut a = Box::new(Block::new(Box::new([1i32])));
-        let mut b = Box::new(Block::new(Box::new([2i32])));
-        let mut c = Box::new(Block::new(Box::new([3i32])));
+        let b = Box::new(Block::new(Box::new([2i32])));
+        let c = Box::new(Block::new(Box::new([3i32])));
 
         {
-            let mut ptr = WritePtr::from_block(&mut a);
-            ptr = ptr.append(b).append(c);
+            let ptr = WritePtr::from_block(&mut a);
+            ptr.append(b).append(c);
         }
 
         assert!(*a.data == vec!(1)[..]);
         assert!(*a.next().unwrap().data == vec!(2)[..]);
         assert!(*a.next().unwrap().next().unwrap().data == vec!(3)[..]);
+    }
+
+    struct Canary(Arc<AtomicUsize>);
+
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn block_drop() {
+        let v = Arc::new(AtomicUsize::new(0));
+        let mut a = Box::new(Block::new(Box::new([Canary(v.clone())])));
+        let b = Box::new(Block::new(Box::new([Canary(v.clone())])));
+        let c = Box::new(Block::new(Box::new([Canary(v.clone())])));
+        let d = Box::new(Block::new(Box::new([Canary(v.clone())])));
+        let f = Box::new(Block::new(Box::new([Canary(v.clone())])));
+
+        {
+            let ptr = WritePtr::from_block(&mut a);
+            ptr.append(b).append(c).append(d).append(f);
+        }
+
+        assert_eq!(v.load(Ordering::SeqCst), 0);
+        drop(a);
+        assert_eq!(v.load(Ordering::SeqCst), 5);
     }
 }
