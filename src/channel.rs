@@ -1,4 +1,5 @@
 use std::sync::atomic::*;
+use std::sync::Arc;
 use std::ptr;
 use std::mem;
 
@@ -40,11 +41,18 @@ impl<T> Drop for Block<T> {
     }
 }
 
-struct WritePtr<'a, T: 'static> {
-    next: &'a AtomicPtr<Block<T>>
+#[derive(Copy)]
+struct WritePtr<T> {
+    next: *const AtomicPtr<Block<T>>
 }
 
-impl<'a, T: Send+Sync> WritePtr<'a, T> {
+impl<T: Send+Sync> WritePtr<T> {
+    /// Create a WritePtr from a channel
+    fn from_channel(channel: &Channel<T>) -> WritePtr<T> {
+        WritePtr { next: &channel.head }
+    }
+
+
     /// Create a WritePtr from the Next point embeeded in the Block
     fn from_block(block: &Block<T>) -> WritePtr<T> {
         WritePtr { next: &block.next }
@@ -56,7 +64,7 @@ impl<'a, T: Send+Sync> WritePtr<'a, T> {
     fn write(&self, b: Box<Block<T>>) -> Option<Box<Block<T>>> {
         unsafe {
             let n: *mut Block<T> = mem::transmute_copy(&b);
-            let prev = self.next.compare_and_swap(ptr::null_mut(), n, Ordering::SeqCst);
+            let prev = self.next_ptr().compare_and_swap(ptr::null_mut(), n, Ordering::SeqCst);
             if prev == ptr::null_mut() {
                 // this was stored in the next pointer so forget it
                 mem::forget(b);
@@ -67,9 +75,13 @@ impl<'a, T: Send+Sync> WritePtr<'a, T> {
         }
     }
 
+    fn next_ptr(&self) -> &AtomicPtr<Block<T>> {
+        unsafe { mem::transmute_copy(&self.next) }
+    }
+
     /// Get the next WritePtr, return None if this is the current tail
-    fn next(&self) -> Option<WritePtr<'a, T>> {
-        let next = self.next.load(Ordering::Relaxed);
+    fn next(&self) -> Option<WritePtr<T>> {
+        let next = self.next_ptr().load(Ordering::Relaxed);
         if next.is_null() {
             None
         } else {
@@ -79,11 +91,11 @@ impl<'a, T: Send+Sync> WritePtr<'a, T> {
 
     /// Seek the current tail, this does not guarantee that the value
     /// return is the current tail, just that it was the tail.
-    fn tail(mut self) -> WritePtr<'a, T> {
+    fn tail(&mut self) {
         loop {
-            self = match self.next() {
+            *self = match self.next() {
                 Some(v) => v,
-                None => return self
+                None => return
             };
         }
     }
@@ -92,14 +104,40 @@ impl<'a, T: Send+Sync> WritePtr<'a, T> {
     /// fails try again until it is written successfully.
     ///
     /// This returns the WritePtr of that block.
-    fn append(mut self, mut b: Box<Block<T>>) -> WritePtr<'a, T> {
+    fn append(&mut self, mut b: Box<Block<T>>) {
         loop {
-            self = self.tail();
+            self.tail();
             b = match self.write(b) {
                 Some(b) => b,
-                None => return self.tail()
+                None => return
             };
         }
+    }
+}
+
+struct Channel<T> {
+    head: AtomicPtr<Block<T>>
+}
+
+pub struct Sender<T> {
+    buffer: Vec<T>,
+    channel: Arc<Channel<T>>,
+    write: WritePtr<T>
+}
+
+impl<T: Send+Sync> Sender<T> {
+    pub fn send(&mut self, value: T) {
+        self.buffer.push(value);
+        if self.buffer.capacity() == self.buffer.len() {
+            self.flush()
+        }
+    }
+
+    pub fn flush(&mut self) {
+        let mut buffer = Vec::new();
+        mem::swap(&mut buffer, &mut self.buffer);
+        let block = Box::new(Block::new(buffer.into_boxed_slice()));
+        self.write.append(block);
     }
 }
 
@@ -136,7 +174,7 @@ mod tests {
         {
             let mut ptr = WritePtr::from_block(&mut a);
             assert!(ptr.write(b).is_none());
-            ptr = ptr.tail();
+            ptr.tail();
             assert!(ptr.write(c).is_none());
         }
 
@@ -152,8 +190,9 @@ mod tests {
         let c = Box::new(Block::new(Box::new([3i32])));
 
         {
-            let ptr = WritePtr::from_block(&mut a);
-            ptr.append(b).append(c);
+            let mut ptr = WritePtr::from_block(&mut a);
+            ptr.append(b);
+            ptr.append(c);
         }
 
         assert!(*a.data == vec!(1)[..]);
@@ -179,8 +218,11 @@ mod tests {
         let f = Box::new(Block::new(Box::new([Canary(v.clone())])));
 
         {
-            let ptr = WritePtr::from_block(&mut a);
-            ptr.append(b).append(c).append(d).append(f);
+            let mut ptr = WritePtr::from_block(&mut a);
+            ptr.append(b);
+            ptr.append(c);
+            ptr.append(d);
+            ptr.append(f);
         }
 
         assert_eq!(v.load(Ordering::SeqCst), 0);
