@@ -41,7 +41,7 @@ impl<T> Drop for Block<T> {
     }
 }
 
-#[derive(Copy)]
+#[derive(Clone)]
 struct WritePtr<T> {
     next: *const AtomicPtr<Block<T>>
 }
@@ -145,6 +145,18 @@ impl<T: Send+Sync> Sender<T> {
     }
 }
 
+impl<T: Sync+Send> Clone for Sender<T> {
+    fn clone(&self) -> Sender<T> {
+        Sender {
+            channel: self.channel.clone(),
+            buffer: Vec::new(),
+            write: WritePtr {
+                next: self.write.next
+            }
+        }
+    }
+}
+
 pub struct Receiver<T> {
     channel: Arc<Channel<T>>,
     current: *const Block<T>,
@@ -173,6 +185,21 @@ impl<T: Send+Sync> Receiver<T> {
                     }
                 }
             }
+        }
+    }
+
+    pub fn restart(&mut self) {
+        self.current = ptr::null();
+        self.index = 0;
+    }
+}
+
+impl<T: Sync+Send> Clone for Receiver<T> {
+    fn clone(&self) -> Receiver<T> {
+        Receiver {
+            channel: self.channel.clone(),
+            current: self.current,
+            index: self.index
         }
     }
 }
@@ -294,5 +321,63 @@ mod tests {
         for i in (0..1000) {
             assert_eq!(r.recv(), Some(&i));
         }
+    }
+
+    #[test]
+    fn channel_send_multiple_recv() {
+        let (mut s, mut r0) = channel();
+        for i in (0..1000) {
+            s.send(i);
+        }
+
+        s.flush();
+
+        let mut r1 = r0.clone();
+        for i in (0..1000) {
+            assert_eq!(r0.recv(), Some(&i));
+        }
+        for i in (0..1000) {
+            assert_eq!(r1.recv(), Some(&i));
+        }
+    }
+
+    #[test]
+    fn channel_recv_restart() {
+        let (mut s, mut r) = channel();
+        for i in (0..1000) {
+            s.send(i);
+        }
+
+        s.flush();
+
+        for i in (0..1000) {
+            assert_eq!(r.recv(), Some(&i));
+        }
+
+        r.restart();
+        for i in (0..1000) {
+            assert_eq!(r.recv(), Some(&i));
+        }
+    }
+
+    #[test]
+    fn channel_multiple_send() {
+        let (mut s0, mut r) = channel();
+        let mut s1 = s0.clone();
+
+        for i in (0..1000) {
+            s0.send(i);
+        }
+        s0.flush();
+
+        for i in (1000..2000) {
+            s1.send(i);
+        }
+        s1.flush();
+
+        for i in (0..2000) {
+            assert_eq!(r.recv(), Some(&i));
+        }
+
     }
 }
