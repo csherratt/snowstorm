@@ -119,6 +119,19 @@ struct Channel<T> {
     head: AtomicPtr<Block<T>>
 }
 
+#[unsafe_destructor]
+impl<T> Drop for Channel<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let head = self.head.swap(ptr::null_mut(), Ordering::SeqCst);
+            if !head.is_null() {
+                let head: Box<Block<T>> = mem::transmute_copy(&head);
+                drop(head);
+            }
+        }
+    }
+}
+
 pub struct Sender<T> {
     channel: Arc<Channel<T>>,
     buffer: Vec<T>,
@@ -380,7 +393,20 @@ mod tests {
         for i in (0..2000) {
             assert_eq!(r.recv(), Some(&i));
         }
+    }
 
+    #[test]
+    fn channel_drop() {
+        let v = Arc::new(AtomicUsize::new(0));
+        let (mut s, _) = channel();
+
+        for i in (0..1_000) {
+            s.send(Canary(v.clone()));
+        }
+
+        assert_eq!(v.load(Ordering::SeqCst), 0);
+        drop(s);
+        assert_eq!(v.load(Ordering::SeqCst), 1_000);
     }
 
     #[bench]
