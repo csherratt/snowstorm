@@ -41,7 +41,6 @@ impl<T> Drop for Block<T> {
     }
 }
 
-#[derive(Clone)]
 struct WritePtr<T> {
     next: *const AtomicPtr<Block<T>>
 }
@@ -132,7 +131,7 @@ impl<T> Drop for Channel<T> {
     }
 }
 
-pub struct Sender<T> {
+pub struct Sender<T: Send+Sync> {
     channel: Arc<Channel<T>>,
     buffer: Vec<T>,
     write: WritePtr<T>
@@ -164,11 +163,14 @@ impl<T: Sync+Send> Clone for Sender<T> {
         Sender {
             channel: self.channel.clone(),
             buffer: Vec::new(),
-            write: WritePtr {
-                next: self.write.next
-            }
+            write: WritePtr { next: self.write.next }
         }
     }
+}
+
+#[unsafe_destructor]
+impl<T: Send+Sync> Drop for Sender<T> {
+    fn drop(&mut self) { self.flush() }
 }
 
 pub struct Receiver<T> {
