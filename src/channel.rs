@@ -137,13 +137,13 @@ pub struct Sender<T: Send+Sync> {
     write: WritePtr<T>
 }
 
+fn sender_size<T>() -> usize {
+    if mem::size_of::<T>() > 2048 { 1 } else { 2048 / mem::size_of::<T>() }
+}
+
 impl<T: Send+Sync> Sender<T> {
     #[inline]
     pub fn send(&mut self, value: T) {
-        if self.buffer.capacity() == 0 {
-            let size = if mem::size_of::<T>() > 2048 { 1 } else { 2048 / mem::size_of::<T>() };
-            self.buffer.reserve(size);
-        }
         self.buffer.push(value);
         if self.buffer.capacity() == self.buffer.len() {
             self.flush()
@@ -151,7 +151,7 @@ impl<T: Send+Sync> Sender<T> {
     }
 
     pub fn flush(&mut self) {
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(sender_size::<T>());
         mem::swap(&mut buffer, &mut self.buffer);
         let block = Box::new(Block::new(buffer.into_boxed_slice()));
         self.write.append(block);
@@ -162,7 +162,7 @@ impl<T: Sync+Send> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
         Sender {
             channel: self.channel.clone(),
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(sender_size::<T>()),
             write: WritePtr { next: self.write.next }
         }
     }
