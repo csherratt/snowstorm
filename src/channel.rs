@@ -138,7 +138,14 @@ pub struct Sender<T: Send+Sync> {
 }
 
 fn sender_size<T>() -> usize {
-    if mem::size_of::<T>() > 2048 { 1 } else { 2048 / mem::size_of::<T>() }
+    let size = mem::size_of::<T>();
+    if size == 0 {
+        2048
+    } else if size >= 2048 {
+        1
+    } else {
+        2048 / size
+    }
 }
 
 impl<T: Send+Sync> Sender<T> {
@@ -415,7 +422,7 @@ mod tests {
     fn bench_channel_send(bench: &mut Bencher) {
         let (mut s, _) = channel();
 
-        let mut i = 0;
+        let mut i: i32 = 0;
 
         bench.iter(|| {
             s.send(i);
@@ -427,7 +434,7 @@ mod tests {
     fn bench_channel_recv(bench: &mut Bencher) {
         let (mut s, mut r) = channel();
 
-        for i in (0..1_000_000) {
+        for i in (0..1_000_000i32) {
             s.send(i);
         }
         s.flush();
