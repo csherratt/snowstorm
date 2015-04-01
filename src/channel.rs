@@ -1,10 +1,11 @@
 use std::sync::atomic::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::ptr;
 use std::mem;
 
 struct Block<T> {
     next: AtomicPtr<Block<T>>,
+    offset: usize,
     data: Box<[T]>
 }
 
@@ -12,12 +13,13 @@ impl<T: Send+Sync> Block<T> {
     fn new(data: Box<[T]>) -> Block<T> {
         Block {
             next: AtomicPtr::new(ptr::null_mut()),
+            offset: 0,
             data: data
         }
     }
 
     fn next<'a>(&'a self) -> Option<&'a Block<T>> {
-        let next = self.next.load(Ordering::Relaxed);
+        let next = self.next.load(Ordering::SeqCst);
         if next.is_null() {
             None
         } else {
@@ -30,37 +32,47 @@ impl<T: Send+Sync> Block<T> {
 #[unsafe_destructor]
 impl<T> Drop for Block<T> {
     fn drop(&mut self) {
-        let mut next = self.next.swap(ptr::null_mut(), Ordering::Relaxed);
+        let mut next = self.next.swap(ptr::null_mut(), Ordering::SeqCst);
         // This avoids recursing more then one level
         while !next.is_null() {
             unsafe {
                 let next_block: Box<Block<T>> = mem::transmute_copy(&next);
-                next = next_block.next.swap(ptr::null_mut(), Ordering::Relaxed);
+                next = next_block.next.swap(ptr::null_mut(), Ordering::SeqCst);
             }
         }
     }
 }
 
 struct WritePtr<T> {
+    offset: usize,
     next: *const AtomicPtr<Block<T>>
 }
 
 impl<T: Send+Sync> WritePtr<T> {
     /// Create a WritePtr from a channel
     fn from_channel(channel: &Channel<T>) -> WritePtr<T> {
-        WritePtr { next: &channel.head }
+        WritePtr {
+            offset: 0,
+            next: &channel.head
+        }
     }
 
 
     /// Create a WritePtr from the Next point embeeded in the Block
     fn from_block(block: &Block<T>) -> WritePtr<T> {
-        WritePtr { next: &block.next }
+        WritePtr {
+            offset: block.offset,
+            next: &block.next
+        }
     }
 
     /// Tries to write a value to the next pointer
     /// on success it returns None meaning the b has been consumed
     /// on failure it returns Some(b) so that b can be written on the next node
-    fn write(&self, b: Box<Block<T>>) -> Option<Box<Block<T>>> {
+    fn write(&self, mut b: Box<Block<T>>) -> Option<Box<Block<T>>> {
+        // write our offset into the block, if this succeeds
+        // the offset will always be the greatest
+        b.offset = self.offset;
         unsafe {
             let n: *mut Block<T> = mem::transmute_copy(&b);
             let prev = self.next_ptr().compare_and_swap(ptr::null_mut(), n, Ordering::SeqCst);
@@ -80,11 +92,16 @@ impl<T: Send+Sync> WritePtr<T> {
 
     /// Get the next WritePtr, return None if this is the current tail
     fn next(&self) -> Option<WritePtr<T>> {
-        let next = self.next_ptr().load(Ordering::Relaxed);
+        let next = self.next_ptr().load(Ordering::SeqCst);
         if next.is_null() {
             None
         } else {
-            unsafe { Some(WritePtr{next: &(*next).next}) }
+            unsafe {
+                Some( WritePtr {
+                    offset: self.offset + (*next).data.len(),
+                    next: &(*next).next
+                })
+            }
         }
     }
 
@@ -114,8 +131,18 @@ impl<T: Send+Sync> WritePtr<T> {
     }
 }
 
+struct Waiting {
+    index: usize,
+    on_wakeup: Box<FnOnce(usize)+Send>
+}
+
 struct Channel<T> {
-    head: AtomicPtr<Block<T>>
+    head: AtomicPtr<Block<T>>,
+    // This is eventually consistent value used for the writes
+    // If the count is greater then the value a writer just appended
+    // the write does not need to enter the wake anyone.
+    count: AtomicUsize,
+    waiters: Mutex<Vec<Waiting>>
 }
 
 #[unsafe_destructor]
@@ -130,6 +157,9 @@ impl<T> Drop for Channel<T> {
         }
     }
 }
+
+
+unsafe impl<T: Sync+Send> Send for Sender<T> {}
 
 pub struct Sender<T: Send+Sync> {
     channel: Arc<Channel<T>>,
@@ -170,7 +200,10 @@ impl<T: Sync+Send> Clone for Sender<T> {
         Sender {
             channel: self.channel.clone(),
             buffer: Vec::with_capacity(sender_size::<T>()),
-            write: WritePtr { next: self.write.next }
+            write: WritePtr {
+                offset: self.write.offset,
+                next: self.write.next
+            }
         }
     }
 }
@@ -183,28 +216,27 @@ impl<T: Send+Sync> Drop for Sender<T> {
 pub struct Receiver<T> {
     channel: Arc<Channel<T>>,
     current: *const Block<T>,
-    index: usize
+    offset: usize
 }
 
 impl<T: Send+Sync> Receiver<T> {
     pub fn recv(&mut self) -> Option<&T> {
-        loop {
-            if self.current.is_null() {
-                unsafe { self.current = mem::transmute_copy(&self.channel.head); };
-            }
+        if self.current.is_null() {
+            unsafe { self.current = mem::transmute_copy(&self.channel.head); };
+        }
 
+        loop {
             if self.current.is_null() {
                 return None;
             } else {
                 unsafe {
-                    if (*self.current).data.len() <= self.index {
-                        let next = (*self.current).next.load(Ordering::Relaxed);
-                        self.index = 0;
+                    let idx = self.offset - (*self.current).offset;
+                    if (*self.current).data.len() <= idx {
+                        let next = (*self.current).next.load(Ordering::SeqCst);
                         self.current = next;
                     } else {
-                        let i = self.index;
-                        self.index += 1;
-                        return Some(&(*self.current).data[i]);
+                        self.offset += 1;
+                        return Some(&(*self.current).data[idx]);
                     }
                 }
             }
@@ -213,7 +245,7 @@ impl<T: Send+Sync> Receiver<T> {
 
     pub fn restart(&mut self) {
         self.current = ptr::null();
-        self.index = 0;
+        self.offset = 0;
     }
 }
 
@@ -222,14 +254,16 @@ impl<T: Sync+Send> Clone for Receiver<T> {
         Receiver {
             channel: self.channel.clone(),
             current: self.current,
-            index: self.index
+            offset: self.offset
         }
     }
 }
 
 fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     let channel = Arc::new(Channel {
-        head: AtomicPtr::new(ptr::null_mut())
+        head: AtomicPtr::new(ptr::null_mut()),
+        count: AtomicUsize::new(0),
+        waiters: Mutex::new(Vec::new())
     });
     (Sender {
         buffer: Vec::new(),
@@ -239,14 +273,16 @@ fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     Receiver {
         channel: channel,
         current: ptr::null(),
-        index: 0
+        offset: 0
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread::Thread;
     use test::{Bencher, black_box};
     use channel::{Block, WritePtr, channel};
 
@@ -416,6 +452,36 @@ mod tests {
         assert_eq!(v.load(Ordering::SeqCst), 0);
         drop(s);
         assert_eq!(v.load(Ordering::SeqCst), 1_000);
+    }
+
+    #[test]
+    fn hundred_writers() {
+        let (mut s0, mut r) = channel();
+
+        let start = Arc::new(Barrier::new(100));
+        let end = Arc::new(Barrier::new(100));
+
+        for i in (0..100) {
+            let mut s = s0.clone();
+            let start = start.clone();
+            let end = end.clone();
+            Thread::spawn(move || {
+                start.wait();
+                for j in (0..100) {
+                    s.send(i*100 + j);
+                    s.flush();
+                }
+                end.wait();
+            });
+        }
+
+        let mut expected: BTreeSet<i32> = (0..10_000).collect();
+        while let Some(i) = r.recv() {
+            println!("{}", i);
+            assert_eq!(expected.remove(i), true);
+        }
+
+        assert_eq!(expected.len(), 0);
     }
 
     #[bench]
