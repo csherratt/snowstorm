@@ -188,10 +188,12 @@ impl<T: Send+Sync> Sender<T> {
     }
 
     pub fn flush(&mut self) {
-        let mut buffer = Vec::with_capacity(sender_size::<T>());
-        mem::swap(&mut buffer, &mut self.buffer);
-        let block = Box::new(Block::new(buffer.into_boxed_slice()));
-        self.write.append(block);
+        if self.buffer.len() != 0 {
+            let mut buffer = Vec::with_capacity(sender_size::<T>());
+            mem::swap(&mut buffer, &mut self.buffer);
+            let block = Box::new(Block::new(buffer.into_boxed_slice()));
+            self.write.append(block);
+        }
     }
 }
 
@@ -221,7 +223,7 @@ pub struct Receiver<T> {
 
 impl<T: Send+Sync> Receiver<T> {
     pub fn recv(&mut self) -> Option<&T> {
-        if self.current.is_null() {
+        if self.offset == 0 && self.current.is_null() {
             unsafe { self.current = mem::transmute_copy(&self.channel.head); };
         }
 
@@ -279,6 +281,7 @@ fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
+    use std::mem;
     use std::collections::BTreeSet;
     use std::sync::atomic::*;
     use std::sync::{Arc, Barrier};
@@ -477,7 +480,6 @@ mod tests {
 
         let mut expected: BTreeSet<i32> = (0..10_000).collect();
         while let Some(i) = r.recv() {
-            println!("{}", i);
             assert_eq!(expected.remove(i), true);
         }
 
@@ -494,13 +496,16 @@ mod tests {
             s.send(i);
             i += 1;
         });
+
+        bench.bytes = 4;
     }
 
     #[bench]
     fn bench_channel_recv(bench: &mut Bencher) {
         let (mut s, mut r) = channel();
 
-        for i in (0..1_000_000i32) {
+        // this might need to be bigger
+        for i in (0..10_000_000i32) {
             s.send(i);
         }
         s.flush();
@@ -508,5 +513,9 @@ mod tests {
         bench.iter(|| {
             black_box(r.recv());
         });
+
+        // iff this panics it means we did not set up enough elements...
+        r.recv().unwrap();
+        bench.bytes = 4;
     }
 }
