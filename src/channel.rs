@@ -69,19 +69,20 @@ impl<T: Send+Sync> WritePtr<T> {
     /// Tries to write a value to the next pointer
     /// on success it returns None meaning the b has been consumed
     /// on failure it returns Some(b) so that b can be written on the next node
-    fn write(&self, mut b: Box<Block<T>>) -> Option<Box<Block<T>>> {
+    fn write(&self, mut b: Box<Block<T>>) -> Result<usize, Box<Block<T>>> {
         // write our offset into the block, if this succeeds
         // the offset will always be the greatest
         b.offset = self.offset;
+        let offset = self.offset + b.data.len();
         unsafe {
             let n: *mut Block<T> = mem::transmute_copy(&b);
             let prev = self.next_ptr().compare_and_swap(ptr::null_mut(), n, Ordering::SeqCst);
             if prev == ptr::null_mut() {
                 // this was stored in the next pointer so forget it
                 mem::forget(b);
-                None
+                Ok(offset)
             } else {
-                Some(b)
+                Err(b)
             }
         }
     }
@@ -120,12 +121,12 @@ impl<T: Send+Sync> WritePtr<T> {
     /// fails try again until it is written successfully.
     ///
     /// This returns the WritePtr of that block.
-    fn append(&mut self, mut b: Box<Block<T>>) {
+    fn append(&mut self, mut b: Box<Block<T>>) -> usize {
         loop {
             self.tail();
             b = match self.write(b) {
-                Some(b) => b,
-                None => return
+                Err(b) => b,
+                Ok(offset) => return offset
             };
         }
     }
@@ -297,8 +298,8 @@ mod tests {
 
         {
             let ptr = WritePtr::from_block(&mut a);
-            assert!(ptr.write(b).is_none());
-            ptr.write(c).unwrap();
+            assert_eq!(ptr.write(b).ok(), Some(1));
+            assert!(ptr.write(c).is_err());
         }
 
         assert!(*a.data == vec!(1)[..]);
@@ -315,9 +316,9 @@ mod tests {
 
         {
             let mut ptr = WritePtr::from_block(&mut a);
-            assert!(ptr.write(b).is_none());
+            assert_eq!(ptr.write(b).ok(), Some(1));
             ptr.tail();
-            assert!(ptr.write(c).is_none());
+            assert_eq!(ptr.write(c).ok(), Some(2));
         }
 
         assert!(*a.data == vec!(1)[..]);
