@@ -1,5 +1,6 @@
 use std::sync::atomic::*;
 use std::sync::{Arc, Mutex};
+use std::thunk::Thunk;
 use std::ptr;
 use std::mem;
 
@@ -134,7 +135,7 @@ impl<T: Send+Sync> WritePtr<T> {
 
 struct Waiting {
     index: usize,
-    on_wakeup: Box<FnOnce(usize)+Send>
+    on_wakeup: Thunk<'static, usize, ()>
 }
 
 struct Channel<T> {
@@ -144,6 +145,83 @@ struct Channel<T> {
     // the write does not need to enter the wake anyone.
     count: AtomicUsize,
     waiters: Mutex<Vec<Waiting>>
+}
+
+impl<T: Send+Sync> Channel<T> {
+    fn add_to_waitlist(&self, wait: Waiting) {
+        let start = self.count.load(Ordering::SeqCst);
+
+        {
+            let mut guard = self.waiters.lock().unwrap();
+            guard.push(wait);
+        }
+
+        // since we locked the waiters, it is possible
+        // a writer came in and missed a wake up. It's our
+        // job to see if that happened
+        let end = self.count.load(Ordering::SeqCst);
+        if start != end {
+            self.wake_waiter(end);
+        }
+    }
+
+    fn wake_waiter(&self, mut count: usize) {
+        loop {
+            match self.waiters.try_lock() {
+                Ok(mut waiting) => {
+                    // wake up only the items that are behind us
+                    // swap_remove lets us remove these without
+                    // to much overhead.
+                    let mut i = 0;
+                    while i < waiting.len() {
+                        if waiting[i].index <= count {
+                            let mut v = waiting.swap_remove(i).on_wakeup;
+                            v.invoke(count);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                },
+                // someone else waking people up, they lose and
+                // will have to also wake up anyone our payload just
+                // woke up.
+                Err(_) => return
+            }
+
+            // the lock is released now, we have to check if someone
+            // hit the Error case above and bailed, if they did
+            // we have to do their job for them.
+            let current = self.count.load(Ordering::SeqCst);
+            if current == count {
+                count = current;
+                return
+            }
+        }
+    }
+
+    fn advance_count(&self, mut from: usize, to: usize) {
+        loop {
+            let count = self.count.compare_and_swap(from, to, Ordering::SeqCst);
+
+            // if the count is greater then what we are moving it to
+            // it means we lost the race and need to give up
+            if count > to {
+                return;
+
+            // If the value read was still not the value we expected it means
+            // someone has fallen behind. We move out from to their from.
+            // There is a case where we try and update the from, jump back to do
+            // work meanwhile some does work for us. In that case
+            } else if count != from {
+                from = count;
+                continue
+
+            // we won the race and did the correct update
+            } else {
+                return self.wake_waiter(to);
+            }
+        }
+    }
 }
 
 #[unsafe_destructor]
@@ -159,7 +237,6 @@ impl<T> Drop for Channel<T> {
     }
 }
 
-
 unsafe impl<T: Sync+Send> Send for Sender<T> {}
 
 pub struct Sender<T: Send+Sync> {
@@ -171,11 +248,11 @@ pub struct Sender<T: Send+Sync> {
 fn sender_size<T>() -> usize {
     let size = mem::size_of::<T>();
     if size == 0 {
-        2048
-    } else if size >= 2048 {
+        4096
+    } else if size >= 4096 {
         1
     } else {
-        2048 / size
+        4096 / size
     }
 }
 
@@ -189,12 +266,16 @@ impl<T: Send+Sync> Sender<T> {
     }
 
     pub fn flush(&mut self) {
-        if self.buffer.len() != 0 {
-            let mut buffer = Vec::with_capacity(sender_size::<T>());
-            mem::swap(&mut buffer, &mut self.buffer);
-            let block = Box::new(Block::new(buffer.into_boxed_slice()));
-            self.write.append(block);
-        }
+        // a 0 sized buffer should not be written
+        if self.buffer.len() == 0 { return }
+
+        let mut buffer = Vec::with_capacity(sender_size::<T>());
+        mem::swap(&mut buffer, &mut self.buffer);
+        let block = Box::new(Block::new(buffer.into_boxed_slice()));
+        let mut to = self.write.append(block);
+        let mut from = self.write.offset;
+
+        self.channel.advance_count(from, to);
     }
 }
 
@@ -249,6 +330,14 @@ impl<T: Send+Sync> Receiver<T> {
     pub fn restart(&mut self) {
         self.current = ptr::null();
         self.offset = 0;
+    }
+
+    fn wait<F>(&self, f: F) where F: FnOnce(usize), F: Send + 'static {
+        let waiting = Waiting {
+            index: self.offset,
+            on_wakeup: Thunk::with_arg(f)
+        };
+        self.channel.add_to_waitlist(waiting);
     }
 }
 
@@ -485,6 +574,33 @@ mod tests {
         }
 
         assert_eq!(expected.len(), 0);
+    }
+
+    #[test]
+    fn waiting_recv() {
+        let (mut s, mut r) = channel();
+        let barrier0 = Arc::new(Barrier::new(2));
+        let barrier1 = Arc::new(Barrier::new(2));
+
+        let barrier0_sender = barrier0.clone();
+        let barrier1_sender = barrier1.clone();
+        Thread::spawn(move || {
+            barrier0_sender.wait();
+            s.send(0i32);
+            s.flush();
+            barrier1_sender.wait();
+        });
+
+        let v = Arc::new(AtomicUsize::new(0));
+        assert!(r.recv().is_none());
+        let v1 = v.clone();
+        assert_eq!(0, v.load(Ordering::SeqCst));
+        r.wait(move |_| { v1.fetch_add(1, Ordering::SeqCst); });
+        assert_eq!(0, v.load(Ordering::SeqCst));
+        barrier0.wait();
+        barrier1.wait();
+        assert_eq!(1, v.load(Ordering::SeqCst));
+        assert!(r.recv().is_some());
     }
 
     #[bench]
