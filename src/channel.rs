@@ -1,5 +1,5 @@
 use std::sync::atomic::*;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Semaphore};
 use std::thunk::Thunk;
 use std::ptr;
 use std::mem;
@@ -52,10 +52,7 @@ struct WritePtr<T> {
 impl<T: Send+Sync> WritePtr<T> {
     /// Create a WritePtr from a channel
     fn from_channel(channel: &Channel<T>) -> WritePtr<T> {
-        WritePtr {
-            offset: 0,
-            next: &channel.head
-        }
+        WritePtr::from_block(&channel.head)
     }
 
 
@@ -139,7 +136,7 @@ struct Waiting {
 }
 
 struct Channel<T> {
-    head: AtomicPtr<Block<T>>,
+    head: Block<T>,
     // This is eventually consistent value used for the writes
     // If the count is greater then the value a writer just appended
     // the write does not need to enter the wake anyone.
@@ -150,6 +147,10 @@ struct Channel<T> {
 impl<T: Send+Sync> Channel<T> {
     fn add_to_waitlist(&self, wait: Waiting) {
         let start = self.count.load(Ordering::SeqCst);
+        if start > wait.index {
+            wait.on_wakeup.invoke(start);
+            return;
+        }
 
         {
             let mut guard = self.waiters.lock().unwrap();
@@ -224,19 +225,6 @@ impl<T: Send+Sync> Channel<T> {
     }
 }
 
-#[unsafe_destructor]
-impl<T> Drop for Channel<T> {
-    fn drop(&mut self) {
-        unsafe {
-            let head = self.head.swap(ptr::null_mut(), Ordering::SeqCst);
-            if !head.is_null() {
-                let head: Box<Block<T>> = mem::transmute_copy(&head);
-                drop(head);
-            }
-        }
-    }
-}
-
 unsafe impl<T: Sync+Send> Send for Sender<T> {}
 
 pub struct Sender<T: Send+Sync> {
@@ -248,11 +236,11 @@ pub struct Sender<T: Send+Sync> {
 fn sender_size<T>() -> usize {
     let size = mem::size_of::<T>();
     if size == 0 {
-        4096
-    } else if size >= 4096 {
+        8192
+    } else if size >= 8192 {
         1
     } else {
-        4096 / size
+        8192 / size
     }
 }
 
@@ -297,39 +285,55 @@ impl<T: Send+Sync> Drop for Sender<T> {
     fn drop(&mut self) { self.flush() }
 }
 
+unsafe impl<T: Sync+Send> Send for Receiver<T> {}
+
 pub struct Receiver<T> {
     channel: Arc<Channel<T>>,
     current: *const Block<T>,
-    offset: usize
+    offset: usize,
+    sema: Arc<Semaphore>
 }
 
 impl<T: Send+Sync> Receiver<T> {
-    pub fn recv(&mut self) -> Option<&T> {
-        if self.offset == 0 && self.current.is_null() {
-            unsafe { self.current = mem::transmute_copy(&self.channel.head); };
-        }
-
+    pub fn try_recv<'a>(&'a mut self) -> Option<&'a T> { unsafe {
         loop {
-            if self.current.is_null() {
-                return None;
-            } else {
-                unsafe {
-                    let idx = self.offset - (*self.current).offset;
-                    if (*self.current).data.len() <= idx {
-                        let next = (*self.current).next.load(Ordering::SeqCst);
-                        self.current = next;
-                    } else {
-                        self.offset += 1;
-                        return Some(&(*self.current).data[idx]);
-                    }
+            let idx = self.offset - (*self.current).offset;
+            if (*self.current).data.len() <= idx {
+                let next = (*self.current).next.load(Ordering::SeqCst);
+                if next.is_null() {
+                    return None;
+                } else {
+                    self.current = next;
                 }
+            } else {
+                self.offset += 1;
+                return Some(&(*self.current).data[idx]);
             }
         }
-    }
+    }}
 
-    pub fn restart(&mut self) {
-        self.current = ptr::null();
-        self.offset = 0;
+    pub fn recv<'a>(&'a mut self) -> Option<&'a T> {
+        /// This is a hack to make the borrow checker like us
+        unsafe {loop {
+            let idx = self.offset - (*self.current).offset;
+            if (*self.current).data.len() <= idx {
+                let next = (*self.current).next.load(Ordering::SeqCst);
+                if next.is_null() {
+                    break;
+                } else {
+                    self.current = next;
+                }
+            } else {
+                self.offset += 1;
+                return Some(&(*self.current).data[idx]);
+            }
+        }}
+
+        let sema = self.sema.clone();
+        self.wait(move |_| { sema.release() });
+        self.sema.acquire();
+
+        self.try_recv()
     }
 
     fn wait<F>(&self, f: F) where F: FnOnce(usize), F: Send + 'static {
@@ -346,17 +350,19 @@ impl<T: Sync+Send> Clone for Receiver<T> {
         Receiver {
             channel: self.channel.clone(),
             current: self.current,
-            offset: self.offset
+            offset: self.offset,
+            sema: Arc::new(Semaphore::new(0))
         }
     }
 }
 
 pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     let channel = Arc::new(Channel {
-        head: AtomicPtr::new(ptr::null_mut()),
+        head: Block::new(Vec::new().into_boxed_slice()),
         count: AtomicUsize::new(0),
         waiters: Mutex::new(Vec::new())
     });
+    let channel_ptr = &channel.head as *const Block<T>;
     (Sender {
         buffer: Vec::new(),
         channel: channel.clone(),
@@ -364,8 +370,9 @@ pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     },
     Receiver {
         channel: channel,
-        current: ptr::null(),
-        offset: 0
+        current: channel_ptr,
+        offset: 0,
+        sema: Arc::new(Semaphore::new(0))
     })
 }
 
@@ -472,7 +479,7 @@ mod tests {
         s.flush();
 
         for i in (0..1000) {
-            assert_eq!(r.recv(), Some(&i));
+            assert_eq!(r.try_recv(), Some(&i));
         }
     }
 
@@ -487,29 +494,10 @@ mod tests {
 
         let mut r1 = r0.clone();
         for i in (0..1000) {
-            assert_eq!(r0.recv(), Some(&i));
+            assert_eq!(r0.try_recv(), Some(&i));
         }
         for i in (0..1000) {
-            assert_eq!(r1.recv(), Some(&i));
-        }
-    }
-
-    #[test]
-    fn channel_recv_restart() {
-        let (mut s, mut r) = channel();
-        for i in (0..1000) {
-            s.send(i);
-        }
-
-        s.flush();
-
-        for i in (0..1000) {
-            assert_eq!(r.recv(), Some(&i));
-        }
-
-        r.restart();
-        for i in (0..1000) {
-            assert_eq!(r.recv(), Some(&i));
+            assert_eq!(r1.try_recv(), Some(&i));
         }
     }
 
@@ -529,7 +517,7 @@ mod tests {
         s1.flush();
 
         for i in (0..2000) {
-            assert_eq!(r.recv(), Some(&i));
+            assert_eq!(r.try_recv(), Some(&i));
         }
     }
 
@@ -538,13 +526,16 @@ mod tests {
         let v = Arc::new(AtomicUsize::new(0));
         let (mut s, _) = channel();
 
-        for i in (0..1_000) {
+        for i in (0..1000) {
             s.send(Canary(v.clone()));
+            if i & 0xF == 8 {
+                s.flush();
+            }
         }
 
         assert_eq!(v.load(Ordering::SeqCst), 0);
         drop(s);
-        assert_eq!(v.load(Ordering::SeqCst), 1_000);
+        assert_eq!(v.load(Ordering::SeqCst), 1000);
     }
 
     #[test]
@@ -562,17 +553,15 @@ mod tests {
                 start.wait();
                 for j in (0..100) {
                     s.send(i*100 + j);
-                    s.flush();
                 }
                 end.wait();
             });
         }
 
         let mut expected: BTreeSet<i32> = (0..10_000).collect();
-        while let Some(i) = r.recv() {
+        while let Some(i) = r.try_recv() {
             assert_eq!(expected.remove(i), true);
         }
-
         assert_eq!(expected.len(), 0);
     }
 
@@ -592,7 +581,7 @@ mod tests {
         });
 
         let v = Arc::new(AtomicUsize::new(0));
-        assert!(r.recv().is_none());
+        assert!(r.try_recv().is_none());
         let v1 = v.clone();
         assert_eq!(0, v.load(Ordering::SeqCst));
         r.wait(move |_| { v1.fetch_add(1, Ordering::SeqCst); });
@@ -600,7 +589,7 @@ mod tests {
         barrier0.wait();
         barrier1.wait();
         assert_eq!(1, v.load(Ordering::SeqCst));
-        assert!(r.recv().is_some());
+        assert!(r.try_recv().is_some());
     }
 
     #[bench]
@@ -628,11 +617,11 @@ mod tests {
         s.flush();
 
         bench.iter(|| {
-            black_box(r.recv());
+            black_box(r.try_recv());
         });
 
         // iff this panics it means we did not set up enough elements...
-        r.recv().unwrap();
+        r.try_recv().unwrap();
         bench.bytes = 4;
     }
 }
