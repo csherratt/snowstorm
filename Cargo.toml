@@ -3,3 +3,9 @@
 name = "snowstorm"
 version = "0.0.1"
 authors = ["Colin Sherratt <colin.sherratt@gmail.com>"]
+
+[dev-dependencies.time]
+
+[[example]]
+name = "throughput"
+

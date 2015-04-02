@@ -351,7 +351,7 @@ impl<T: Sync+Send> Clone for Receiver<T> {
     }
 }
 
-fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
+pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     let channel = Arc::new(Channel {
         head: AtomicPtr::new(ptr::null_mut()),
         count: AtomicUsize::new(0),
