@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, Semaphore};
 use std::thunk::Thunk;
 use std::ptr;
 use std::mem;
+use alloc::boxed::FnBox;
 
 struct Block<T> {
     next: AtomicPtr<Block<T>>,
@@ -132,7 +133,7 @@ impl<T: Send+Sync> WritePtr<T> {
 
 struct Waiting {
     index: usize,
-    on_wakeup: Thunk<'static, (), ()>
+    on_wakeup: Box<FnBox() + Send + 'static>
 }
 
 struct Channel<T> {
