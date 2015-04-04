@@ -9,10 +9,11 @@ use std::thread;
 use std::sync::{Barrier, Arc};
 use time::precise_time_s;
 
-const TOTAL_MESSAGES: usize = 10_000_000_000;
-const TOTAL_SENDERS: usize = 4;
+const TOTAL_MESSAGES: usize = 1_000_000_000;
+const TOTAL_SENDERS: usize = 2;
 
 fn main() {
+    /*
     let (src, recv) = channel();
 
     let start = Arc::new(Barrier::new(TOTAL_SENDERS+1));
@@ -75,33 +76,32 @@ fn main() {
 
     drop(src);
     drop(recv);
-
-    let (src, recv) = channel();
-
-    let end = Arc::new(Barrier::new(TOTAL_SENDERS+1));
+    */
+    let (src, mut recv) = channel();
+    let end = Arc::new(Barrier::new(2));
 
     let start_time = precise_time_s();
     for i in (0..TOTAL_SENDERS) {
         let mut s = src.clone();
-        let mut r = recv.clone();
-        let end = end.clone();
         thread::spawn(move || {
             let max = TOTAL_MESSAGES / TOTAL_SENDERS;
             for _ in (0..max) {
                 s.send(i as u8);
             }
         });
-        thread::spawn(move || {
-            let mut count = 0;
-            while let Some(v) = r.recv() {
-                count += 1;
-                if count == TOTAL_MESSAGES {
-                    break;
-                }
-            }
-            end.wait();
-        });
     }
+    
+    let e = end.clone();
+    thread::spawn(move || {
+        let mut count = 0;
+        while let Some(v) = recv.recv() {
+            count += 1;
+            if count == TOTAL_MESSAGES {
+                break;
+            }
+        }
+        e.wait();
+    });
 
     end.wait();
     let end_time = precise_time_s();
@@ -109,6 +109,6 @@ fn main() {
         TOTAL_MESSAGES,
         end_time - start_time,
         (TOTAL_MESSAGES) as f64 / (end_time - start_time),
-        (TOTAL_MESSAGES*TOTAL_SENDERS) as f64 / (end_time - start_time)
+        (TOTAL_MESSAGES) as f64 / (end_time - start_time)
     );
 }

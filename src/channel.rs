@@ -132,7 +132,7 @@ impl<T: Send+Sync> WritePtr<T> {
 
 struct Waiting {
     index: usize,
-    on_wakeup: Thunk<'static, usize, ()>
+    on_wakeup: Thunk<'static, (), ()>
 }
 
 struct Channel<T> {
@@ -148,7 +148,7 @@ impl<T: Send+Sync> Channel<T> {
     fn add_to_waitlist(&self, wait: Waiting) {
         let start = self.count.load(Ordering::SeqCst);
         if start > wait.index {
-            wait.on_wakeup.invoke(start);
+            (wait.on_wakeup)();
             return;
         }
 
@@ -177,7 +177,7 @@ impl<T: Send+Sync> Channel<T> {
                     while i < waiting.len() {
                         if waiting[i].index <= count {
                             let mut v = waiting.swap_remove(i).on_wakeup;
-                            v.invoke(count);
+                            v();
                         } else {
                             i += 1;
                         }
@@ -295,51 +295,56 @@ pub struct Receiver<T> {
 }
 
 impl<T: Send+Sync> Receiver<T> {
-    pub fn try_recv<'a>(&'a mut self) -> Option<&'a T> { unsafe {
-        loop {
-            let idx = self.offset - (*self.current).offset;
-            if (*self.current).data.len() <= idx {
-                let next = (*self.current).next.load(Ordering::SeqCst);
-                if next.is_null() {
-                    return None;
-                } else {
-                    self.current = next;
-                }
-            } else {
-                self.offset += 1;
-                return Some(&(*self.current).data[idx]);
+    fn next(&mut self) -> bool {
+        unsafe {
+            let next = (*self.current).next.load(Ordering::SeqCst);
+            if !next.is_null() {
+                self.current = next;
             }
+            !next.is_null()
+        }
+    }
+
+    fn idx(&self) -> usize { unsafe { self.offset - (*self.current).offset } }
+    fn idx_post_inc(&mut self) -> usize {
+        let idx = self.idx();
+        self.offset += 1;
+        return idx;
+    }
+
+    pub fn try_recv<'a>(&'a mut self) -> Option<&'a T> { unsafe {
+        if self.pending() {
+            let idx = self.idx_post_inc();
+            Some(&(*self.current).data[idx])
+        } else {
+            None
         }
     }}
 
-    pub fn recv<'a>(&'a mut self) -> Option<&'a T> {
-        /// This is a hack to make the borrow checker like us
-        unsafe {loop {
-            let idx = self.offset - (*self.current).offset;
-            if (*self.current).data.len() <= idx {
-                let next = (*self.current).next.load(Ordering::SeqCst);
-                if next.is_null() {
-                    break;
-                } else {
-                    self.current = next;
-                }
+    /// check to see if there is data pending
+    pub fn pending(&mut self) -> bool {
+        unsafe {
+            if (*self.current).data.len() <= self.idx() {
+                self.next()
             } else {
-                self.offset += 1;
-                return Some(&(*self.current).data[idx]);
+                true
             }
-        }}
+        }
+    }
 
-        let sema = self.sema.clone();
-        self.wait(move |_| { sema.release() });
-        self.sema.acquire();
-
+    pub fn recv<'a>(&'a mut self) -> Option<&'a T> {
+        if !self.pending() {
+            let sema = self.sema.clone();
+            self.wait(move || { sema.release() });
+            self.sema.acquire();
+        }
         self.try_recv()
     }
 
-    fn wait<F>(&self, f: F) where F: FnOnce(usize), F: Send + 'static {
+    fn wait<F>(&self, f: F) where F: FnOnce(), F: Send + 'static {
         let waiting = Waiting {
             index: self.offset,
-            on_wakeup: Thunk::with_arg(f)
+            on_wakeup: Box::new(f)
         };
         self.channel.add_to_waitlist(waiting);
     }
@@ -382,7 +387,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::*;
     use std::sync::{Arc, Barrier};
-    use std::thread::Thread;
+    use std::thread;
     use test::{Bencher, black_box};
     use channel::{Block, WritePtr, channel};
 
@@ -549,7 +554,7 @@ mod tests {
             let mut s = s0.clone();
             let start = start.clone();
             let end = end.clone();
-            Thread::spawn(move || {
+            thread::spawn(move || {
                 start.wait();
                 for j in (0..100) {
                     s.send(i*100 + j);
@@ -573,7 +578,7 @@ mod tests {
 
         let barrier0_sender = barrier0.clone();
         let barrier1_sender = barrier1.clone();
-        Thread::spawn(move || {
+        thread::spawn(move || {
             barrier0_sender.wait();
             s.send(0i32);
             s.flush();
@@ -584,7 +589,7 @@ mod tests {
         assert!(r.try_recv().is_none());
         let v1 = v.clone();
         assert_eq!(0, v.load(Ordering::SeqCst));
-        r.wait(move |_| { v1.fetch_add(1, Ordering::SeqCst); });
+        r.wait(move || { v1.fetch_add(1, Ordering::SeqCst); });
         assert_eq!(0, v.load(Ordering::SeqCst));
         barrier0.wait();
         barrier1.wait();
