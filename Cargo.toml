@@ -7,7 +7,7 @@ authors = ["Colin Sherratt <colin.sherratt@gmail.com>"]
 [dev-dependencies.time]
 
 [dependencies.atom]
-path = "../atom"
+git = "https://github.com/csherratt/atom.git"
 
 [[example]]
 name = "throughput"

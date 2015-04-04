@@ -13,7 +13,6 @@ const TOTAL_MESSAGES: usize = 1_000_000_000;
 const TOTAL_SENDERS: usize = 2;
 
 fn main() {
-    /*
     let (src, recv) = channel();
 
     let start = Arc::new(Barrier::new(TOTAL_SENDERS+1));
@@ -76,7 +75,7 @@ fn main() {
 
     drop(src);
     drop(recv);
-    */
+
     let (src, mut recv) = channel();
     let end = Arc::new(Barrier::new(2));
 

@@ -29,12 +29,6 @@ struct WritePtr<T> {
 }
 
 impl<'a, T: Send+Sync> WritePtr<T> {
-    /// Create a WritePtr from a channel
-    fn from_channel(channel: &Channel<T>) -> WritePtr<T> {
-        WritePtr::from_block(channel.head.clone())
-    }
-
-
     /// Create a WritePtr from the Next point embeeded in the Block
     fn from_block(block: Arc<Block<T>>) -> WritePtr<T> {
         WritePtr {
@@ -96,8 +90,7 @@ struct Waiting {
     on_wakeup: Box<FnBox() + Send + 'static>
 }
 
-struct Channel<T> {
-    head: Arc<Block<T>>,
+struct Channel {
     // This is eventually consistent value used for the writes
     // If the count is greater then the value a writer just appended
     // the write does not need to enter the wake anyone.
@@ -105,7 +98,7 @@ struct Channel<T> {
     waiters: Mutex<Vec<Waiting>>
 }
 
-impl<T: Send+Sync> Channel<T> {
+impl Channel {
     fn add_to_waitlist(&self, wait: Waiting) {
         let start = self.count.load(Ordering::SeqCst);
         if start > wait.index {
@@ -188,7 +181,7 @@ impl<T: Send+Sync> Channel<T> {
 unsafe impl<T: Sync+Send> Send for Sender<T> {}
 
 pub struct Sender<T: Send+Sync> {
-    channel: Arc<Channel<T>>,
+    channel: Arc<Channel>,
     buffer: Vec<T>,
     write: WritePtr<T>
 }
@@ -248,7 +241,7 @@ impl<T: Send+Sync> Drop for Sender<T> {
 unsafe impl<T: Sync+Send> Send for Receiver<T> {}
 
 pub struct Receiver<T> {
-    channel: Arc<Channel<T>>,
+    channel: Arc<Channel>,
     current: Arc<Block<T>>,
     offset: usize,
     index: usize,
@@ -323,20 +316,21 @@ impl<T: Sync+Send> Clone for Receiver<T> {
 
 pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     let channel = Arc::new(Channel {
-        head: Arc::new(Block::new(Vec::new().into_boxed_slice())),
         count: AtomicUsize::new(0),
         waiters: Mutex::new(Vec::new())
     });
 
+    let head = Arc::new(Block::new(Vec::new().into_boxed_slice()));
+
     let tx = Sender {
         buffer: Vec::new(),
         channel: channel.clone(),
-        write: WritePtr::from_channel(&channel)
+        write: WritePtr::from_block(head.clone())
     };
 
     let rx = Receiver {
-        channel: channel.clone(),
-        current: channel.head.clone(),
+        channel: channel,
+        current: head,
         offset: 0,
         index: 0,
         sema: Arc::new(Semaphore::new(0))
@@ -485,7 +479,7 @@ mod tests {
     #[test]
     fn channel_drop() {
         let v = Arc::new(AtomicUsize::new(0));
-        let (mut s, _) = channel();
+        let (mut s, r) = channel();
 
         for i in (0..1000) {
             s.send(Canary(v.clone()));
@@ -496,6 +490,7 @@ mod tests {
 
         assert_eq!(v.load(Ordering::SeqCst), 0);
         drop(s);
+        drop(r);
         assert_eq!(v.load(Ordering::SeqCst), 1000);
     }
 
