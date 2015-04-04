@@ -6,6 +6,9 @@ authors = ["Colin Sherratt <colin.sherratt@gmail.com>"]
 
 [dev-dependencies.time]
 
+[dependencies.atom]
+path = "../atom"
+
 [[example]]
 name = "throughput"
 
