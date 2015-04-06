@@ -340,7 +340,7 @@ pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     let head = Arc::new(Block::new(Vec::new().into_boxed_slice()));
 
     let tx = Sender {
-        buffer: Vec::new(),
+        buffer: Vec::with_capacity(sender_size::<T>()),
         channel: channel.clone(),
         write: WritePtr::from_block(head.clone())
     };
@@ -362,7 +362,6 @@ mod tests {
     use std::sync::atomic::*;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use test::{Bencher, black_box};
     use channel::{Block, WritePtr, channel};
 
     #[test]
@@ -564,7 +563,7 @@ mod tests {
         assert_eq!(1, v.load(Ordering::SeqCst));
         assert!(r.try_recv().is_some());
     }
-
+/*
     #[bench]
     fn bench_channel_send(bench: &mut Bencher) {
         let (mut s, _) = channel();
@@ -597,4 +596,5 @@ mod tests {
         r.try_recv().unwrap();
         bench.bytes = 4;
     }
+*/
 }

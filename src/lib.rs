@@ -1,7 +1,5 @@
 #![feature(unsafe_destructor, std_misc, core, alloc)]
 
-#[cfg(test)]
-extern crate test;
 extern crate alloc;
 extern crate atom;
 
