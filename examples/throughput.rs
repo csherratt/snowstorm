@@ -10,7 +10,7 @@ use std::sync::{Barrier, Arc};
 use time::precise_time_s;
 
 const TOTAL_MESSAGES: usize = 1_000_000_000;
-const TOTAL_SENDERS: usize = 2;
+const TOTAL_SENDERS: usize = 4;
 
 fn main() {
     let (src, recv) = channel();
@@ -53,10 +53,7 @@ fn main() {
         let end = end.clone();
         thread::spawn(move || {
             start.wait();
-            let mut count = 0;
-            while let Some(_) = r.try_recv() {
-                count += 1;
-            }
+            while let Some(_) = r.try_recv() {}
             end.wait();
         });
     }
@@ -93,7 +90,7 @@ fn main() {
     let e = end.clone();
     thread::spawn(move || {
         let mut count = 0;
-        while let Some(v) = recv.recv() {
+        while let Some(_) = recv.recv() {
             count += 1;
             if count == TOTAL_MESSAGES {
                 break;

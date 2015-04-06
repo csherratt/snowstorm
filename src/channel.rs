@@ -2,11 +2,28 @@ use std::sync::{Arc, Mutex, Semaphore};
 use std::sync::atomic::AtomicUsize;
 use std::mem;
 use alloc::boxed::FnBox;
+use alloc::arc::unique;
 use atom::*;
 
 struct Block<T> {
     next: AtomSetOnce<Block<T>, Arc<Block<T>>>,
     data: Box<[T]>
+}
+
+impl<T> Drop for Block<T> {
+    fn drop(&mut self) {
+        while let Some(mut n) = self.next.atom().take(Ordering::SeqCst) {
+            if let Some(n) = unique(&mut n) {
+                if let Some(next) = n.next.atom().take(Ordering::SeqCst) {
+                    self.next.set_if_none(next, Ordering::SeqCst);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl<T: Send+Sync> Block<T> {
@@ -240,7 +257,7 @@ impl<T: Send+Sync> Drop for Sender<T> {
 
 unsafe impl<T: Sync+Send> Send for Receiver<T> {}
 
-pub struct Receiver<T> {
+pub struct Receiver<T: Send+Sync> {
     channel: Arc<Channel>,
     current: Arc<Block<T>>,
     offset: usize,

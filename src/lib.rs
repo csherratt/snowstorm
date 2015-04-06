@@ -1,4 +1,4 @@
-#![feature(unsafe_destructor, test, std_misc, core, alloc)]
+#![feature(unsafe_destructor, std_misc, core, alloc)]
 
 #[cfg(test)]
 extern crate test;
