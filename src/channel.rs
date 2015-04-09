@@ -170,7 +170,8 @@ impl<T: Send+Sync> Channel<T> {
         }
     }
 
-    fn wake_waiter(&self, mut count: usize, force: bool) {
+    fn wake_waiter(&self, mut count: usize, force: bool) -> usize {
+        let mut woke = 0;
         loop {
             match self.waiters.try_lock() {
                 Ok(mut waiting) => {
@@ -179,7 +180,8 @@ impl<T: Send+Sync> Channel<T> {
                     // to much overhead.
                     let mut i = 0;
                     while i < waiting.len() {
-                        if waiting[i].index <= count || force {
+                        if waiting[i].index < count || force {
+                            woke += 1;
                             let v = waiting.swap_remove(i).on_wakeup;
                             v();
                         } else {
@@ -190,7 +192,7 @@ impl<T: Send+Sync> Channel<T> {
                 // someone else waking people up, they lose and
                 // will have to also wake up anyone our payload just
                 // woke up.
-                Err(_) => return
+                Err(_) => return woke
             }
 
             // the lock is released now, we have to check if someone
@@ -198,26 +200,26 @@ impl<T: Send+Sync> Channel<T> {
             // we have to do their job for them.
             let current = self.count.load(Ordering::SeqCst);
             if current == count {
-                return
+                return woke;
             } else {
                 count = current;
             }
         }
     }
 
-    fn force_wake(&self) {
+    fn force_wake(&self) -> usize {
         let count = self.count.load(Ordering::SeqCst);
-        self.wake_waiter(count, true);
+        self.wake_waiter(count, true)
     }
 
-    fn advance_count(&self, mut from: usize, to: usize) {
+    fn advance_count(&self, mut from: usize, to: usize) -> usize {
         loop {
             let count = self.count.compare_and_swap(from, to, Ordering::SeqCst);
 
             // if the count is greater then what we are moving it to
             // it means we lost the race and need to give up
             if count > to {
-                return;
+                return 0;
 
             // If the value read was still not the value we expected it means
             // someone has fallen behind. We move out from to their from.
@@ -307,14 +309,7 @@ impl<T: Send+Sync> Sender<T> {
         }
     }
 
-    pub fn close(mut self) {
-        self.flush();
-
-        let last = self.channel.senders.fetch_sub(1, Ordering::SeqCst);
-        if last == 1 {
-            self.channel.force_wake();
-        }
-    }
+    pub fn close(self) {}
 }
 
 impl<T: Sync+Send> Clone for Sender<T> {
@@ -334,7 +329,14 @@ impl<T: Sync+Send> Clone for Sender<T> {
 
 #[unsafe_destructor]
 impl<T: Send+Sync> Drop for Sender<T> {
-    fn drop(&mut self) { self.flush() }
+    fn drop(&mut self) {
+        self.flush();
+
+        let last = self.channel.senders.fetch_sub(1, Ordering::SeqCst);
+        if last == 1 {
+            self.channel.force_wake();
+        }
+    }
 }
 
 unsafe impl<T: Sync+Send> Send for Receiver<T> {}
@@ -351,8 +353,8 @@ impl<T: Send+Sync> Receiver<T> {
     fn next(&mut self) -> bool {
         if let Some(next) = self.current.next.dup(Ordering::SeqCst) {
             self.current = next;
-            self.index = 0;
             self.offset += self.index;
+            self.index = 0;
             true
         } else {
             false
@@ -401,6 +403,11 @@ impl<T: Send+Sync> Receiver<T> {
                 ReceiverError::EndOfFrame
             })
         } else {
+            println!("{} {} {} {}",
+                self.index, self.offset,
+                self.channel.senders.load(Ordering::SeqCst) == 0,
+                self.channel.next.get(Ordering::SeqCst).is_none()
+            );
             panic!("Woken up but channel is still active, and no data.");
         }
     }

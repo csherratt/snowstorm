@@ -12,3 +12,5 @@ git = "https://github.com/csherratt/atom.git"
 [[example]]
 name = "throughput"
 
+[[example]]
+name = "chain"
