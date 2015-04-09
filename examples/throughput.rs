@@ -90,7 +90,7 @@ fn main() {
     let e = end.clone();
     thread::spawn(move || {
         let mut count = 0;
-        while let Some(_) = recv.recv() {
+        while let Ok(_) = recv.recv() {
             count += 1;
             if count == TOTAL_MESSAGES {
                 break;

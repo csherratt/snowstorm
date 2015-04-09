@@ -2,8 +2,18 @@ use std::sync::{Arc, Mutex, Semaphore};
 use std::sync::atomic::AtomicUsize;
 use std::mem;
 use alloc::boxed::FnBox;
-use alloc::arc::unique;
+use alloc::arc::get_mut;
 use atom::*;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReceiverError {
+    /// The frame has come to an end, move to the `next`
+    /// frame in time.
+    EndOfFrame,
+    /// The frame has come to an end, and there is no
+    /// future frames to move to.
+    ChannelClosed
+}
 
 struct Block<T> {
     next: AtomSetOnce<Block<T>, Arc<Block<T>>>,
@@ -13,7 +23,7 @@ struct Block<T> {
 impl<T> Drop for Block<T> {
     fn drop(&mut self) {
         while let Some(mut n) = self.next.atom().take(Ordering::SeqCst) {
-            if let Some(n) = unique(&mut n) {
+            if let Some(n) = get_mut(&mut n) {
                 if let Some(next) = n.next.atom().take(Ordering::SeqCst) {
                     self.next.set_if_none(next, Ordering::SeqCst);
                 } else {
@@ -107,7 +117,16 @@ struct Waiting {
     on_wakeup: Box<FnBox() + Send + 'static>
 }
 
-struct Channel {
+struct ChannelNext<T>(Arc<Channel<T>>, Arc<Block<T>>);
+
+struct Channel<T> {
+    // next is used when a channel reaches the end of the frame
+    // it is used as a link to the next frame.
+    next: AtomSetOnce<ChannelNext<T>, Box<ChannelNext<T>>>,
+    // Keeps track of the numbe of senders, when it reaches
+    // 0 it indicates that we are at the end of the frame.
+    senders: AtomicUsize,
+
     // This is eventually consistent value used for the writes
     // If the count is greater then the value a writer just appended
     // the write does not need to enter the wake anyone.
@@ -115,7 +134,19 @@ struct Channel {
     waiters: Mutex<Vec<Waiting>>
 }
 
-impl Channel {
+impl<T: Send+Sync> Channel<T> {
+    fn new() -> (Arc<Channel<T>>, Arc<Block<T>>) {
+        let next = Arc::new(Channel {
+            next: AtomSetOnce::empty(),
+            count: AtomicUsize::new(0),
+            senders: AtomicUsize::new(1),
+            waiters: Mutex::new(Vec::new())
+        });
+
+        let head = Arc::new(Block::new(Vec::new().into_boxed_slice()));
+        (next, head)
+    }
+
     fn add_to_waitlist(&self, wait: Waiting) {
         let start = self.count.load(Ordering::SeqCst);
         if start > wait.index {
@@ -132,12 +163,13 @@ impl Channel {
         // a writer came in and missed a wake up. It's our
         // job to see if that happened
         let end = self.count.load(Ordering::SeqCst);
-        if start != end {
-            self.wake_waiter(end);
+        let force = self.senders.load(Ordering::SeqCst) == 0;
+        if start != end || force {
+            self.wake_waiter(end, force);
         }
     }
 
-    fn wake_waiter(&self, count: usize) {
+    fn wake_waiter(&self, count: usize, force: bool) {
         loop {
             match self.waiters.try_lock() {
                 Ok(mut waiting) => {
@@ -146,7 +178,7 @@ impl Channel {
                     // to much overhead.
                     let mut i = 0;
                     while i < waiting.len() {
-                        if waiting[i].index <= count {
+                        if waiting[i].index <= count || force {
                             let v = waiting.swap_remove(i).on_wakeup;
                             v();
                         } else {
@@ -170,6 +202,11 @@ impl Channel {
         }
     }
 
+    fn force_wake(&self) {
+        let count = self.count.load(Ordering::SeqCst);
+        self.wake_waiter(count, true);
+    }
+
     fn advance_count(&self, mut from: usize, to: usize) {
         loop {
             let count = self.count.compare_and_swap(from, to, Ordering::SeqCst);
@@ -189,16 +226,28 @@ impl Channel {
 
             // we won the race and did the correct update
             } else {
-                return self.wake_waiter(to);
+                return self.wake_waiter(to, false);
             }
         }
+    }
+
+    fn next(&self) -> &ChannelNext<T> {
+        if self.next.get(Ordering::SeqCst).is_none() {
+            let (next, head) = Channel::new();
+            self.next.set_if_none(
+                Box::new(ChannelNext(next, head)),
+                Ordering::SeqCst
+            );
+        }
+
+        self.next.get(Ordering::SeqCst).map(|x| &*x).unwrap()
     }
 }
 
 unsafe impl<T: Sync+Send> Send for Sender<T> {}
 
 pub struct Sender<T: Send+Sync> {
-    channel: Arc<Channel>,
+    channel: Arc<Channel<T>>,
     buffer: Vec<T>,
     write: WritePtr<T>
 }
@@ -224,7 +273,6 @@ impl<T: Send+Sync> Sender<T> {
     }
 
     pub fn flush(&mut self) {
-        // a 0 sized buffer should not be written
         if self.buffer.len() == 0 { return }
 
         let mut buffer = Vec::with_capacity(sender_size::<T>());
@@ -235,10 +283,34 @@ impl<T: Send+Sync> Sender<T> {
 
         self.channel.advance_count(from, to);
     }
+
+    pub fn next_frame(&mut self) {
+        let last = self.channel.senders.fetch_sub(1, Ordering::SeqCst);
+        self.flush();
+
+        if last == 0 {
+            self.channel.force_wake();
+        }
+
+        let (channel, block) = {
+            let &ChannelNext(ref ch, ref block) = self.channel.next();
+            (ch.clone(), block.clone())
+        };
+ 
+        self.channel = channel;
+        self.write = WritePtr::from_block(block);
+    }
+
+    pub fn close(mut self) {
+        self.channel.senders.fetch_sub(1, Ordering::SeqCst);
+        self.flush();
+    }
 }
 
 impl<T: Sync+Send> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
+        self.channel.senders.fetch_add(1, Ordering::SeqCst);
+
         Sender {
             channel: self.channel.clone(),
             buffer: Vec::with_capacity(sender_size::<T>()),
@@ -258,7 +330,7 @@ impl<T: Send+Sync> Drop for Sender<T> {
 unsafe impl<T: Sync+Send> Send for Receiver<T> {}
 
 pub struct Receiver<T: Send+Sync> {
-    channel: Arc<Channel>,
+    channel: Arc<Channel<T>>,
     current: Arc<Block<T>>,
     offset: usize,
     index: usize,
@@ -301,13 +373,25 @@ impl<T: Send+Sync> Receiver<T> {
         }
     }
 
-    pub fn recv<'a>(&'a mut self) -> Option<&'a T> {
+    pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
         if !self.pending() {
             let sema = self.sema.clone();
             self.wait(move || { sema.release() });
             self.sema.acquire();
         }
-        self.try_recv()
+
+        if self.pending() {
+            let idx = self.idx_post_inc();
+            Ok(&self.current.data[idx])
+        } else if self.channel.senders.load(Ordering::SeqCst) == 0 {
+            Err(if self.channel.next.get(Ordering::SeqCst).is_none() {
+                ReceiverError::ChannelClosed
+            } else {
+                ReceiverError::EndOfFrame
+            })
+        } else {
+            panic!("Woken up but channel is still active, and no data.")
+        }
     }
 
     fn wait<F>(&self, f: F) where F: FnOnce(), F: Send + 'static {
@@ -316,6 +400,18 @@ impl<T: Send+Sync> Receiver<T> {
             on_wakeup: Box::new(f)
         };
         self.channel.add_to_waitlist(waiting);
+    }
+
+    pub fn next_frame(&mut self) {
+        let (channel, block) = {
+            let &ChannelNext(ref ch, ref block) = self.channel.next();
+            (ch.clone(), block.clone())
+        };
+ 
+        self.channel = channel;
+        self.current = block;
+        self.offset = 0;
+        self.index = 0;
     }
 }
 
@@ -332,12 +428,7 @@ impl<T: Sync+Send> Clone for Receiver<T> {
 }
 
 pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
-    let channel = Arc::new(Channel {
-        count: AtomicUsize::new(0),
-        waiters: Mutex::new(Vec::new())
-    });
-
-    let head = Arc::new(Block::new(Vec::new().into_boxed_slice()));
+    let (channel, head) = Channel::new();
 
     let tx = Sender {
         buffer: Vec::with_capacity(sender_size::<T>()),
@@ -362,7 +453,7 @@ mod tests {
     use std::sync::atomic::*;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use channel::{Block, WritePtr, channel};
+    use channel::{Block, WritePtr, channel, ReceiverError};
 
     #[test]
     fn write_ptr_write() {
@@ -562,6 +653,24 @@ mod tests {
         barrier1.wait();
         assert_eq!(1, v.load(Ordering::SeqCst));
         assert!(r.try_recv().is_some());
+    }
+
+    #[test]
+    fn next_frame() {
+        let (mut s, mut r) = channel();
+        for i in 0..1000 {
+            s.send(i);
+            s.send(-i);
+            s.next_frame();
+        }
+        s.close();
+        for i in 0..1000 {
+            assert_eq!(r.recv(), Ok(&i));
+            assert_eq!(r.recv(), Ok(&-i));
+            assert_eq!(r.recv(), Err(ReceiverError::EndOfFrame));
+            r.next_frame();
+        }
+        assert_eq!(r.recv(), Err(ReceiverError::ChannelClosed));
     }
 /*
     #[bench]
