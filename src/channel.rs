@@ -4,6 +4,7 @@ use std::mem;
 use alloc::boxed::FnBox;
 use alloc::arc::get_mut;
 use atom::*;
+use std::thread;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReceiverError {
@@ -135,11 +136,11 @@ struct Channel<T> {
 }
 
 impl<T: Send+Sync> Channel<T> {
-    fn new() -> (Arc<Channel<T>>, Arc<Block<T>>) {
+    fn new(senders: usize) -> (Arc<Channel<T>>, Arc<Block<T>>) {
         let next = Arc::new(Channel {
             next: AtomSetOnce::empty(),
             count: AtomicUsize::new(0),
-            senders: AtomicUsize::new(1),
+            senders: AtomicUsize::new(senders),
             waiters: Mutex::new(Vec::new())
         });
 
@@ -169,7 +170,7 @@ impl<T: Send+Sync> Channel<T> {
         }
     }
 
-    fn wake_waiter(&self, count: usize, force: bool) {
+    fn wake_waiter(&self, mut count: usize, force: bool) {
         loop {
             match self.waiters.try_lock() {
                 Ok(mut waiting) => {
@@ -198,6 +199,8 @@ impl<T: Send+Sync> Channel<T> {
             let current = self.count.load(Ordering::SeqCst);
             if current == count {
                 return
+            } else {
+                count = current;
             }
         }
     }
@@ -233,7 +236,7 @@ impl<T: Send+Sync> Channel<T> {
 
     fn next(&self) -> &ChannelNext<T> {
         if self.next.get(Ordering::SeqCst).is_none() {
-            let (next, head) = Channel::new();
+            let (next, head) = Channel::new(0);
             self.next.set_if_none(
                 Box::new(ChannelNext(next, head)),
                 Ordering::SeqCst
@@ -285,25 +288,32 @@ impl<T: Send+Sync> Sender<T> {
     }
 
     pub fn next_frame(&mut self) {
-        let last = self.channel.senders.fetch_sub(1, Ordering::SeqCst);
         self.flush();
-
-        if last == 0 {
-            self.channel.force_wake();
-        }
 
         let (channel, block) = {
             let &ChannelNext(ref ch, ref block) = self.channel.next();
             (ch.clone(), block.clone())
         };
+
+        channel.senders.fetch_add(1, Ordering::SeqCst);
  
+        let old = self.channel.clone();
         self.channel = channel;
         self.write = WritePtr::from_block(block);
+
+        let last = old.senders.fetch_sub(1, Ordering::SeqCst);
+        if last == 1 {
+            old.force_wake();
+        }
     }
 
     pub fn close(mut self) {
-        self.channel.senders.fetch_sub(1, Ordering::SeqCst);
         self.flush();
+
+        let last = self.channel.senders.fetch_sub(1, Ordering::SeqCst);
+        if last == 1 {
+            self.channel.force_wake();
+        }
     }
 }
 
@@ -342,6 +352,7 @@ impl<T: Send+Sync> Receiver<T> {
         if let Some(next) = self.current.next.dup(Ordering::SeqCst) {
             self.current = next;
             self.index = 0;
+            self.offset += self.index;
             true
         } else {
             false
@@ -376,7 +387,7 @@ impl<T: Send+Sync> Receiver<T> {
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
         if !self.pending() {
             let sema = self.sema.clone();
-            self.wait(move || { sema.release() });
+            self.wait(move || sema.release());
             self.sema.acquire();
         }
 
@@ -390,13 +401,13 @@ impl<T: Send+Sync> Receiver<T> {
                 ReceiverError::EndOfFrame
             })
         } else {
-            panic!("Woken up but channel is still active, and no data.")
+            panic!("Woken up but channel is still active, and no data.");
         }
     }
 
     fn wait<F>(&self, f: F) where F: FnOnce(), F: Send + 'static {
         let waiting = Waiting {
-            index: self.offset,
+            index: self.offset + self.index,
             on_wakeup: Box::new(f)
         };
         self.channel.add_to_waitlist(waiting);
@@ -428,7 +439,7 @@ impl<T: Sync+Send> Clone for Receiver<T> {
 }
 
 pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
-    let (channel, head) = Channel::new();
+    let (channel, head) = Channel::new(1);
 
     let tx = Sender {
         buffer: Vec::with_capacity(sender_size::<T>()),
@@ -664,6 +675,28 @@ mod tests {
             s.next_frame();
         }
         s.close();
+        for i in 0..1000 {
+            assert_eq!(r.recv(), Ok(&i));
+            assert_eq!(r.recv(), Ok(&-i));
+            assert_eq!(r.recv(), Err(ReceiverError::EndOfFrame));
+            r.next_frame();
+        }
+        assert_eq!(r.recv(), Err(ReceiverError::ChannelClosed));
+    }
+
+
+    #[test]
+    fn next_frame_threaded() {
+        let (mut s, mut r) = channel();
+        thread::spawn(move || {
+            for i in 0..1000 {
+                s.send(i);
+                s.send(-i);
+                s.next_frame();
+                thread::sleep_ms(1);
+            }
+            s.close();
+        });
         for i in 0..1000 {
             assert_eq!(r.recv(), Ok(&i));
             assert_eq!(r.recv(), Ok(&-i));
