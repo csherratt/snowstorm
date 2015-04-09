@@ -14,3 +14,7 @@ name = "throughput"
 
 [[example]]
 name = "chain"
+
+
+[[example]]
+name = "chain_mpsc"

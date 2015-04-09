@@ -1,8 +1,7 @@
-extern crate snowstorm;
 extern crate time;
 
-use snowstorm::channel::*;
 use std::thread;
+use std::sync::mpsc::*;
 use time::precise_time_s;
 
 const THREADS: usize = 100;
@@ -10,19 +9,8 @@ const FRAMES: usize = 1000;
 const ITEMS: usize = 10_000;
 
 fn worker(mut input: Receiver<(f64, f64)>, mut output: Sender<(f64, f64)>) {
-	loop {
-		match input.recv() {
-			Ok(&(k, v)) => {
-				output.send((k, v + v));
-			}
-			Err(ReceiverError::EndOfFrame) => {
-				input.next_frame();
-				output.next_frame();
-			}
-			Err(ReceiverError::ChannelClosed) => {
-				return;
-			}
-		}
+	for (k, v) in input.iter() {
+		output.send((k, v + v));
 	}
 }
 
@@ -42,23 +30,11 @@ fn main() {
 	}
 
 	let start = precise_time_s();
-	for _ in 0..FRAMES {
-		tx.next_frame();
-
-		loop {
-			match rx.recv() {
-				Ok(&(s, _)) => {
-					tx.send((s, s));
-				}
-				Err(ReceiverError::EndOfFrame) => {
-					rx.next_frame();
-					break;
-				},
-				Err(ReceiverError::ChannelClosed) => {
-					return;
-				}
-			}
+	for (i, (k, v)) in rx.iter().enumerate() {
+		if i > ITEMS * FRAMES {
+			break;
 		}
+		tx.send((k, v + v));
 	}
 	let end = precise_time_s();
 	let t = end - start;
