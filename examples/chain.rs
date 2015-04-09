@@ -5,6 +5,10 @@ use snowstorm::channel::*;
 use std::thread;
 use time::precise_time_s;
 
+const THREADS: usize = 100;
+const FRAMES: usize = 1000;
+const ITEMS: usize = 100_000;
+
 fn worker(mut input: Receiver<(f64, f64)>, mut output: Sender<(f64, f64)>) {
 	loop {
 		match input.recv() {
@@ -24,32 +28,30 @@ fn worker(mut input: Receiver<(f64, f64)>, mut output: Sender<(f64, f64)>) {
 
 fn main() {
 	let (mut tx, mut rx) = channel();	
-	for _ in 0..100 {
-		let (mut t, mut r) = channel();
+	for _ in 0..THREADS {
+		let (t, r) = channel();
 		thread::spawn(move || {
 			worker(rx, t);
 		});
 		rx = r;
 	}
 
-	for i in 0..1_000 {
-		let start = precise_time_s();
+	for j in 0..ITEMS {
+		let v = j as f64;
+		tx.send((v, v));
+	}
 
-		for j in 0..10_000 {
-			let v = j as f64 * i as f64;
-			tx.send((v, v));
-		}
+	let start = precise_time_s();
+	for _ in 0..FRAMES {
 		tx.next_frame();
 
 		loop {
 			match rx.recv() {
-				Ok(&(s, o)) => {
-					//println!("{} => {}", s, o);
+				Ok(&(s, _)) => {
+					tx.send((s, s));
 				}
 				Err(ReceiverError::EndOfFrame) => {
 					rx.next_frame();
-					let end = precise_time_s();
-					println!("{} took {}s", i, end - start);
 					break;
 				},
 				Err(ReceiverError::ChannelClosed) => {
@@ -58,4 +60,12 @@ fn main() {
 			}
 		}
 	}
+	let end = precise_time_s();
+	let t = end - start;
+	println!("Send {} messages in {} seconds {} million messages per second",
+		THREADS * ITEMS * FRAMES,
+		t,
+		(THREADS * ITEMS * FRAMES) as f64 / (1e6 * t)
+	);
+
 }
