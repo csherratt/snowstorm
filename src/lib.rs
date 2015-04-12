@@ -4,3 +4,4 @@ extern crate alloc;
 extern crate atom;
 
 pub mod channel;
+pub mod select;

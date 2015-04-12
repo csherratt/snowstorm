@@ -4,7 +4,6 @@ use std::mem;
 use alloc::boxed::FnBox;
 use alloc::arc::get_mut;
 use atom::*;
-use std::thread;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReceiverError {
