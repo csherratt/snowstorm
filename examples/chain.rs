@@ -5,9 +5,9 @@ use snowstorm::channel::*;
 use std::thread;
 use time::precise_time_s;
 
-const THREADS: usize = 100;
-const FRAMES: usize = 1000;
-const ITEMS: usize = 10_000;
+const THREADS: usize = 16;
+const FRAMES: usize = 4000;
+const ITEMS: usize = 1000;
 
 fn worker(mut input: Receiver<(f64, f64)>, mut output: Sender<(f64, f64)>) {
 	loop {

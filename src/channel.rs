@@ -420,7 +420,13 @@ impl<T: Send+Sync> Receiver<T> {
         self.channel.add_to_waitlist(waiting);
     }
 
-    pub fn next_frame(&mut self) {
+    pub fn next_frame(&mut self) -> bool {
+        // checkc to see if the channel has been closed.
+        if self.channel.senders.load(Ordering::SeqCst) == 0 &&
+           self.channel.next.get(Ordering::SeqCst).is_none() {
+            return false;
+        }
+
         let (channel, block) = {
             let &ChannelNext(ref ch, ref block) = self.channel.next();
             (ch.clone(), block.clone())
@@ -430,6 +436,7 @@ impl<T: Send+Sync> Receiver<T> {
         self.current = block;
         self.offset = 0;
         self.index = 0;
+        true
     }
 }
 
