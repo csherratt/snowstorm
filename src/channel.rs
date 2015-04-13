@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex, Semaphore};
 use std::sync::atomic::AtomicUsize;
 use std::mem;
+use std::thread;
 use alloc::boxed::FnBox;
 use alloc::arc::get_mut;
 use atom::*;
+use select::*;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReceiverError {
@@ -114,7 +116,7 @@ impl<'a, T: Send+Sync> WritePtr<T> {
 
 struct Waiting {
     index: usize,
-    on_wakeup: Box<FnBox() + Send + 'static>
+    wake: Wake
 }
 
 struct ChannelNext<T>(Arc<Channel<T>>, Arc<Block<T>>);
@@ -147,16 +149,19 @@ impl<T: Send+Sync> Channel<T> {
         (next, head)
     }
 
-    fn add_to_waitlist(&self, wait: Waiting) {
+    fn add_to_waitlist(&self, index: usize, wake: Wake) {
         let start = self.count.load(Ordering::SeqCst);
-        if start > wait.index {
-            (wait.on_wakeup)();
+        if start > index {
+            wake.trigger();
             return;
         }
 
         {
             let mut guard = self.waiters.lock().unwrap();
-            guard.push(wait);
+            guard.push(Waiting{
+                index: index,
+                wake: wake
+            });
         }
 
         // since we locked the waiters, it is possible
@@ -181,8 +186,7 @@ impl<T: Send+Sync> Channel<T> {
                     while i < waiting.len() {
                         if waiting[i].index < count || force {
                             woke += 1;
-                            let v = waiting.swap_remove(i).on_wakeup;
-                            v();
+                            waiting.swap_remove(i).wake.trigger();
                         } else {
                             i += 1;
                         }
@@ -386,37 +390,33 @@ impl<T: Send+Sync> Receiver<T> {
     }
 
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
-        if !self.pending() {
-            let sema = self.sema.clone();
-            self.wait(move || sema.release());
-            self.sema.acquire();
+        loop {
+            if !self.pending() {
+                self.wait(Wake::thread());
+                thread::park();
+            } else {
+                break;
+            }
+
+            match (self.channel.senders.load(Ordering::SeqCst) == 0,
+                   self.channel.next.get(Ordering::SeqCst).is_none(),
+                   self.pending()) {
+                (_,    _,     true)  => break,
+                (true, true,  false) => return Err(ReceiverError::ChannelClosed),
+                (true, false, false) => return Err(ReceiverError::EndOfFrame),
+                _ => ()
+            }
         }
 
-        if self.pending() {
-            let idx = self.idx_post_inc();
-            Ok(&self.current.data[idx])
-        } else if self.channel.senders.load(Ordering::SeqCst) == 0 {
-            Err(if self.channel.next.get(Ordering::SeqCst).is_none() {
-                ReceiverError::ChannelClosed
-            } else {
-                ReceiverError::EndOfFrame
-            })
-        } else {
-            println!("{} {} {} {}",
-                self.index, self.offset,
-                self.channel.senders.load(Ordering::SeqCst) == 0,
-                self.channel.next.get(Ordering::SeqCst).is_none()
-            );
-            panic!("Woken up but channel is still active, and no data.");
-        }
+        let idx = self.idx_post_inc();
+        Ok(&self.current.data[idx])
     }
 
-    fn wait<F>(&self, f: F) where F: FnOnce(), F: Send + 'static {
-        let waiting = Waiting {
-            index: self.offset + self.index,
-            on_wakeup: Box::new(f)
-        };
-        self.channel.add_to_waitlist(waiting);
+    pub fn wait(&self, wake: Wake) {
+        self.channel.add_to_waitlist(
+            self.offset + self.index,
+            wake
+        );
     }
 
     pub fn next_frame(&mut self) -> bool {
@@ -473,7 +473,6 @@ pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::atomic::*;
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -554,202 +553,4 @@ mod tests {
         drop(a);
         assert_eq!(v.load(Ordering::SeqCst), 5);
     }
-
-    #[test]
-    fn channel_send() {
-        let (mut s, mut r) = channel();
-        for i in (0..1000) {
-            s.send(i);
-        }
-
-        s.flush();
-
-        for i in (0..1000) {
-            assert_eq!(r.try_recv(), Some(&i));
-        }
-    }
-
-    #[test]
-    fn channel_send_multiple_recv() {
-        let (mut s, mut r0) = channel();
-        for i in (0..1000) {
-            s.send(i);
-        }
-
-        s.flush();
-
-        let mut r1 = r0.clone();
-        for i in (0..1000) {
-            assert_eq!(r0.try_recv(), Some(&i));
-        }
-        for i in (0..1000) {
-            assert_eq!(r1.try_recv(), Some(&i));
-        }
-    }
-
-    #[test]
-    fn channel_multiple_send() {
-        let (mut s0, mut r) = channel();
-        let mut s1 = s0.clone();
-
-        for i in (0..1000) {
-            s0.send(i);
-        }
-        s0.flush();
-
-        for i in (1000..2000) {
-            s1.send(i);
-        }
-        s1.flush();
-
-        for i in (0..2000) {
-            assert_eq!(r.try_recv(), Some(&i));
-        }
-    }
-
-    #[test]
-    fn channel_drop() {
-        let v = Arc::new(AtomicUsize::new(0));
-        let (mut s, r) = channel();
-
-        for i in (0..1000) {
-            s.send(Canary(v.clone()));
-            if i & 0xF == 8 {
-                s.flush();
-            }
-        }
-
-        assert_eq!(v.load(Ordering::SeqCst), 0);
-        drop(s);
-        drop(r);
-        assert_eq!(v.load(Ordering::SeqCst), 1000);
-    }
-
-    #[test]
-    fn hundred_writers() {
-        let (s0, mut r) = channel();
-
-        let start = Arc::new(Barrier::new(100));
-        let end = Arc::new(Barrier::new(100));
-
-        for i in (0..100) {
-            let mut s = s0.clone();
-            let start = start.clone();
-            let end = end.clone();
-            thread::spawn(move || {
-                start.wait();
-                for j in (0..100) {
-                    s.send(i*100 + j);
-                }
-                end.wait();
-            });
-        }
-
-        let mut expected: BTreeSet<i32> = (0..10_000).collect();
-        while let Some(i) = r.try_recv() {
-            assert_eq!(expected.remove(i), true);
-        }
-        assert_eq!(expected.len(), 0);
-    }
-
-    #[test]
-    fn waiting_recv() {
-        let (mut s, mut r) = channel();
-        let barrier0 = Arc::new(Barrier::new(2));
-        let barrier1 = Arc::new(Barrier::new(2));
-
-        let barrier0_sender = barrier0.clone();
-        let barrier1_sender = barrier1.clone();
-        thread::spawn(move || {
-            barrier0_sender.wait();
-            s.send(0i32);
-            s.flush();
-            barrier1_sender.wait();
-        });
-
-        let v = Arc::new(AtomicUsize::new(0));
-        assert!(r.try_recv().is_none());
-        let v1 = v.clone();
-        assert_eq!(0, v.load(Ordering::SeqCst));
-        r.wait(move || { v1.fetch_add(1, Ordering::SeqCst); });
-        assert_eq!(0, v.load(Ordering::SeqCst));
-        barrier0.wait();
-        barrier1.wait();
-        assert_eq!(1, v.load(Ordering::SeqCst));
-        assert!(r.try_recv().is_some());
-    }
-
-    #[test]
-    fn next_frame() {
-        let (mut s, mut r) = channel();
-        for i in 0..1000 {
-            s.send(i);
-            s.send(-i);
-            s.next_frame();
-        }
-        s.close();
-        for i in 0..1000 {
-            assert_eq!(r.recv(), Ok(&i));
-            assert_eq!(r.recv(), Ok(&-i));
-            assert_eq!(r.recv(), Err(ReceiverError::EndOfFrame));
-            r.next_frame();
-        }
-        assert_eq!(r.recv(), Err(ReceiverError::ChannelClosed));
-    }
-
-
-    #[test]
-    fn next_frame_threaded() {
-        let (mut s, mut r) = channel();
-        thread::spawn(move || {
-            for i in 0..1000 {
-                s.send(i);
-                s.send(-i);
-                s.next_frame();
-                thread::sleep_ms(1);
-            }
-            s.close();
-        });
-        for i in 0..1000 {
-            assert_eq!(r.recv(), Ok(&i));
-            assert_eq!(r.recv(), Ok(&-i));
-            assert_eq!(r.recv(), Err(ReceiverError::EndOfFrame));
-            r.next_frame();
-        }
-        assert_eq!(r.recv(), Err(ReceiverError::ChannelClosed));
-    }
-/*
-    #[bench]
-    fn bench_channel_send(bench: &mut Bencher) {
-        let (mut s, _) = channel();
-
-        let mut i: i32 = 0;
-
-        bench.iter(|| {
-            s.send(i);
-            i += 1;
-        });
-
-        bench.bytes = 4;
-    }
-
-    #[bench]
-    fn bench_channel_recv(bench: &mut Bencher) {
-        let (mut s, mut r) = channel();
-
-        // this might need to be bigger
-        for i in (0..10_000_000i32) {
-            s.send(i);
-        }
-        s.flush();
-
-        bench.iter(|| {
-            black_box(r.try_recv());
-        });
-
-        // iff this panics it means we did not set up enough elements...
-        r.try_recv().unwrap();
-        bench.bytes = 4;
-    }
-*/
 }

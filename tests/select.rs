@@ -1,6 +1,7 @@
 
 extern crate snowstorm;
 
+use std::thread;
 use snowstorm::select::*;
 
 #[test]
@@ -43,5 +44,25 @@ fn simple_select_reuse() {
             assert_eq!(x.id(), h2_id);
             x.trigger();
         });
+    }
+}
+
+#[test]
+fn collect_1000() {
+    let select = Select::new();
+    let handles: Vec<Handle> = (0..1000).map(|_| select.handle()).collect();
+    thread::spawn(move || {
+        for handle in handles {
+            handle.trigger();
+            thread::sleep_ms(0);
+        }
+    });
+
+    let mut count = 0;
+    for _ in select {
+        count += 1;
+        if count == 1000 {
+            break;
+        }
     }
 }
