@@ -1,7 +1,6 @@
-use std::sync::{Arc, Mutex, Semaphore};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicUsize;
 use std::mem;
-use std::thread;
 use alloc::arc::get_mut;
 use atom::*;
 use pulse::{Pulse, Trigger};
@@ -348,7 +347,6 @@ pub struct Receiver<T: Send+Sync> {
     current: Arc<Block<T>>,
     offset: usize,
     index: usize,
-    sema: Arc<Semaphore>
 }
 
 impl<T: Send+Sync> Receiver<T> {
@@ -391,7 +389,7 @@ impl<T: Send+Sync> Receiver<T> {
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
         loop {
             if !self.pending() {
-                self.pulse().wait();
+                self.pulse().wait().unwrap();
             } else {
                 break;
             }
@@ -445,8 +443,7 @@ impl<T: Sync+Send> Clone for Receiver<T> {
             channel: self.channel.clone(),
             current: self.current.clone(),
             offset: self.offset,
-            index: self.index,
-            sema: Arc::new(Semaphore::new(0))
+            index: self.index
         }
     }
 }
@@ -464,8 +461,7 @@ pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
         channel: channel,
         current: head,
         offset: 0,
-        index: 0,
-        sema: Arc::new(Semaphore::new(0))
+        index: 0
     };
 
     (tx, rx)
@@ -474,9 +470,8 @@ pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::*;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-    use channel::{Block, WritePtr, channel, ReceiverError};
+    use std::sync::Arc;
+    use channel::{Block, WritePtr};
 
     #[test]
     fn write_ptr_write() {

@@ -6,8 +6,6 @@ authors = ["Colin Sherratt <colin.sherratt@gmail.com>"]
 
 [dev-dependencies]
 time="*"
-csv="*"
-rustc-serialize="*"
 
 [dependencies.atom]
 git = "https://github.com/csherratt/atom.git"

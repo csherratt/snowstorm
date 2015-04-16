@@ -8,18 +8,16 @@ const THREADS: usize = 16;
 const FRAMES: usize = 10000;
 const ITEMS: usize = 10000;
 
-fn worker(mut input: Receiver<(f64, f64)>, mut output: Sender<(f64, f64)>) {
+fn worker(input: Receiver<(f64, f64)>, output: Sender<(f64, f64)>) {
 	for (k, v) in input.iter() {
-		output.send((k, v + v));
+		output.send((k, v + v)).unwrap();
 	}
 }
 
 fn main() {
-	let (mut tx, mut rx) = channel();
-	let tx2 = tx.clone();
+	let (tx, mut rx) = channel();
 	for _ in 0..THREADS {
 		let (t, r) = channel();
-		let tx2 = t.clone();
 		thread::spawn(move || {
 			worker(rx, t);
 		});
@@ -28,7 +26,7 @@ fn main() {
 
 	for j in 0..ITEMS {
 		let v = j as f64;
-		tx.send((v, v));
+		tx.send((v, v)).unwrap();
 	}
 
 	let start = precise_time_s();
@@ -36,7 +34,7 @@ fn main() {
 		if i > ITEMS * FRAMES {
 			break;
 		}
-		tx.send((k, v + v));
+		tx.send((k, v + v)).unwrap();
 	}
 	let end = precise_time_s();
 	let t = end - start;
