@@ -2,10 +2,9 @@ use std::sync::{Arc, Mutex, Semaphore};
 use std::sync::atomic::AtomicUsize;
 use std::mem;
 use std::thread;
-use alloc::boxed::FnBox;
 use alloc::arc::get_mut;
 use atom::*;
-use select::*;
+use pulse::{Pulse, Trigger};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReceiverError {
@@ -116,7 +115,7 @@ impl<'a, T: Send+Sync> WritePtr<T> {
 
 struct Waiting {
     index: usize,
-    wake: Wake
+    trigger: Trigger
 }
 
 struct ChannelNext<T>(Arc<Channel<T>>, Arc<Block<T>>);
@@ -149,10 +148,10 @@ impl<T: Send+Sync> Channel<T> {
         (next, head)
     }
 
-    fn add_to_waitlist(&self, index: usize, wake: Wake) {
+    fn add_to_waitlist(&self, index: usize, trigger: Trigger) {
         let start = self.count.load(Ordering::SeqCst);
         if start > index {
-            wake.trigger();
+            trigger.pulse();
             return;
         }
 
@@ -160,7 +159,7 @@ impl<T: Send+Sync> Channel<T> {
             let mut guard = self.waiters.lock().unwrap();
             guard.push(Waiting{
                 index: index,
-                wake: wake
+                trigger: trigger
             });
         }
 
@@ -186,7 +185,7 @@ impl<T: Send+Sync> Channel<T> {
                     while i < waiting.len() {
                         if waiting[i].index < count || force {
                             woke += 1;
-                            waiting.swap_remove(i).wake.trigger();
+                            waiting.swap_remove(i).trigger.pulse();
                         } else {
                             i += 1;
                         }
@@ -392,8 +391,7 @@ impl<T: Send+Sync> Receiver<T> {
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
         loop {
             if !self.pending() {
-                self.wait(Wake::thread());
-                thread::park();
+                self.pulse().wait();
             } else {
                 break;
             }
@@ -412,11 +410,13 @@ impl<T: Send+Sync> Receiver<T> {
         Ok(&self.current.data[idx])
     }
 
-    pub fn wait(&self, wake: Wake) {
+    pub fn pulse(&self) -> Pulse {
+        let (pulse, t) = Pulse::new();
         self.channel.add_to_waitlist(
             self.offset + self.index,
-            wake
+            t
         );
+        pulse
     }
 
     pub fn next_frame(&mut self) -> bool {

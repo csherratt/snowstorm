@@ -4,10 +4,16 @@ name = "snowstorm"
 version = "0.0.1"
 authors = ["Colin Sherratt <colin.sherratt@gmail.com>"]
 
-[dev-dependencies.time]
+[dev-dependencies]
+time="*"
+csv="*"
+rustc-serialize="*"
 
 [dependencies.atom]
 git = "https://github.com/csherratt/atom.git"
+
+[dependencies.pulse]
+git = "https://github.com/csherratt/pulse.git"
 
 [[example]]
 name = "throughput"
