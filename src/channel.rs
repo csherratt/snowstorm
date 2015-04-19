@@ -150,7 +150,7 @@ impl<T: Send+Sync> Channel<T> {
     fn add_to_waitlist(&self, index: usize, trigger: Trigger) {
         let start = self.count.load(Ordering::SeqCst);
         if start > index {
-            trigger.pulse();
+            trigger.trigger();
             return;
         }
 
@@ -167,12 +167,23 @@ impl<T: Send+Sync> Channel<T> {
         // job to see if that happened
         let end = self.count.load(Ordering::SeqCst);
         let force = self.senders.load(Ordering::SeqCst) == 0;
-        if start != end || force {
-            self.wake_waiter(end, force);
+        if force {
+            self.force_wake();
+        } else if start != end  {
+            self.wake_waiter(end);
         }
     }
 
-    fn wake_waiter(&self, mut count: usize, force: bool) -> usize {
+    fn force_wake(&self) -> usize {
+        let mut guard = self.waiters.lock().unwrap();
+        let woke = guard.len();
+        while let Some(w) = guard.pop() {
+            w.trigger.trigger();
+        }
+        woke
+    }
+
+    fn wake_waiter(&self, mut count: usize) -> usize {
         let mut woke = 0;
         loop {
             match self.waiters.try_lock() {
@@ -182,9 +193,9 @@ impl<T: Send+Sync> Channel<T> {
                     // to much overhead.
                     let mut i = 0;
                     while i < waiting.len() {
-                        if waiting[i].index < count || force {
+                        if waiting[i].index < count {
                             woke += 1;
-                            waiting.swap_remove(i).trigger.pulse();
+                            waiting.swap_remove(i).trigger.trigger();
                         } else {
                             i += 1;
                         }
@@ -208,11 +219,6 @@ impl<T: Send+Sync> Channel<T> {
         }
     }
 
-    fn force_wake(&self) -> usize {
-        let count = self.count.load(Ordering::SeqCst);
-        self.wake_waiter(count, true)
-    }
-
     fn advance_count(&self, mut from: usize, to: usize) -> usize {
         loop {
             let count = self.count.compare_and_swap(from, to, Ordering::SeqCst);
@@ -232,7 +238,7 @@ impl<T: Send+Sync> Channel<T> {
 
             // we won the race and did the correct update
             } else {
-                return self.wake_waiter(to, false);
+                return self.wake_waiter(to);
             }
         }
     }

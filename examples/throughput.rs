@@ -10,7 +10,7 @@ use std::sync::{Barrier, Arc};
 use time::precise_time_s;
 
 const TOTAL_MESSAGES: usize = 1_000_000_000;
-const TOTAL_SENDERS: usize = 4;
+const TOTAL_SENDERS: usize = 12;
 
 fn main() {
     let (src, recv) = channel();
@@ -86,6 +86,7 @@ fn main() {
             }
         });
     }
+    src.close();
     
     let e = end.clone();
     thread::spawn(move || {
