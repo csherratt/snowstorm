@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::mem;
 use alloc::arc::get_mut;
 use atom::*;
-use pulse::{Pulse, Trigger};
+use pulse::{Pulse, Signal};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReceiverError {
@@ -16,16 +16,16 @@ pub enum ReceiverError {
 }
 
 struct Block<T> {
-    next: AtomSetOnce<Block<T>, Arc<Block<T>>>,
+    next: AtomSetOnce<Arc<Block<T>>>,
     data: Box<[T]>
 }
 
 impl<T> Drop for Block<T> {
     fn drop(&mut self) {
-        while let Some(mut n) = self.next.atom().take(Ordering::SeqCst) {
+        while let Some(mut n) = self.next.atom().take() {
             if let Some(n) = get_mut(&mut n) {
-                if let Some(next) = n.next.atom().take(Ordering::SeqCst) {
-                    self.next.set_if_none(next, Ordering::SeqCst);
+                if let Some(next) = n.next.atom().take() {
+                    self.next.set_if_none(next);
                 } else {
                     break;
                 }
@@ -46,7 +46,7 @@ impl<T: Send+Sync> Block<T> {
 
     #[cfg(test)]
     fn next<'a>(&'a self) -> Option<&'a Block<T>> {
-        self.next.get(Ordering::SeqCst)
+        self.next.get()
     }
 }
 
@@ -68,7 +68,7 @@ impl<'a, T: Send+Sync> WritePtr<T> {
     /// on success it returns None meaning the b has been consumed
     /// on failure it returns Some(b) so that b can be written on the next node
     fn write(&self, b: Arc<Block<T>>) -> Option<Arc<Block<T>>> {
-        match self.current.next.set_if_none(b, Ordering::SeqCst) {
+        match self.current.next.set_if_none(b) {
             Some(b) => Some(b),
             None => None
         }
@@ -76,7 +76,7 @@ impl<'a, T: Send+Sync> WritePtr<T> {
 
     /// Get the next WritePtr, return None if this is the current tail
     fn next(&self) -> Option<WritePtr<T>> {
-        self.current.next.dup(Ordering::SeqCst).map(|next| {
+        self.current.next.dup().map(|next| {
             let len = next.data.len();
             WritePtr {
                 current: next,
@@ -114,7 +114,7 @@ impl<'a, T: Send+Sync> WritePtr<T> {
 
 struct Waiting {
     index: usize,
-    trigger: Trigger
+    trigger: Pulse
 }
 
 struct ChannelNext<T>(Arc<Channel<T>>, Arc<Block<T>>);
@@ -122,7 +122,7 @@ struct ChannelNext<T>(Arc<Channel<T>>, Arc<Block<T>>);
 struct Channel<T> {
     // next is used when a channel reaches the end of the frame
     // it is used as a link to the next frame.
-    next: AtomSetOnce<ChannelNext<T>, Box<ChannelNext<T>>>,
+    next: AtomSetOnce<Box<ChannelNext<T>>>,
     // Keeps track of the numbe of senders, when it reaches
     // 0 it indicates that we are at the end of the frame.
     senders: AtomicUsize,
@@ -147,10 +147,10 @@ impl<T: Send+Sync> Channel<T> {
         (next, head)
     }
 
-    fn add_to_waitlist(&self, index: usize, trigger: Trigger) {
+    fn add_to_waitlist(&self, index: usize, trigger: Pulse) {
         let start = self.count.load(Ordering::SeqCst);
         if start > index {
-            trigger.trigger();
+            trigger.pulse();
             return;
         }
 
@@ -178,7 +178,7 @@ impl<T: Send+Sync> Channel<T> {
         let mut guard = self.waiters.lock().unwrap();
         let woke = guard.len();
         while let Some(w) = guard.pop() {
-            w.trigger.trigger();
+            w.trigger.pulse();
         }
         woke
     }
@@ -195,7 +195,7 @@ impl<T: Send+Sync> Channel<T> {
                     while i < waiting.len() {
                         if waiting[i].index < count {
                             woke += 1;
-                            waiting.swap_remove(i).trigger.trigger();
+                            waiting.swap_remove(i).trigger.pulse();
                         } else {
                             i += 1;
                         }
@@ -244,15 +244,12 @@ impl<T: Send+Sync> Channel<T> {
     }
 
     fn next(&self) -> &ChannelNext<T> {
-        if self.next.get(Ordering::SeqCst).is_none() {
+        if self.next.get().is_none() {
             let (next, head) = Channel::new(0);
-            self.next.set_if_none(
-                Box::new(ChannelNext(next, head)),
-                Ordering::SeqCst
-            );
+            self.next.set_if_none(Box::new(ChannelNext(next, head)));
         }
 
-        self.next.get(Ordering::SeqCst).map(|x| &*x).unwrap()
+        self.next.get().map(|x| &*x).unwrap()
     }
 }
 
@@ -357,7 +354,7 @@ pub struct Receiver<T: Send+Sync> {
 
 impl<T: Send+Sync> Receiver<T> {
     fn next(&mut self) -> bool {
-        if let Some(next) = self.current.next.dup(Ordering::SeqCst) {
+        if let Some(next) = self.current.next.dup() {
             self.current = next;
             self.offset += self.index;
             self.index = 0;
@@ -395,13 +392,13 @@ impl<T: Send+Sync> Receiver<T> {
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
         loop {
             if !self.pending() {
-                self.pulse().wait().unwrap();
+                self.signal().wait().unwrap();
             } else {
                 break;
             }
 
             match (self.channel.senders.load(Ordering::SeqCst) == 0,
-                   self.channel.next.get(Ordering::SeqCst).is_none(),
+                   self.channel.next.get().is_none(),
                    self.pending()) {
                 (_,    _,     true)  => break,
                 (true, true,  false) => return Err(ReceiverError::ChannelClosed),
@@ -414,19 +411,19 @@ impl<T: Send+Sync> Receiver<T> {
         Ok(&self.current.data[idx])
     }
 
-    pub fn pulse(&self) -> Pulse {
-        let (pulse, t) = Pulse::new();
+    pub fn signal(&self) -> Signal {
+        let (signal, pulse) = Signal::new();
         self.channel.add_to_waitlist(
             self.offset + self.index,
-            t
+            pulse
         );
-        pulse
+        signal
     }
 
     pub fn next_frame(&mut self) -> bool {
         // checkc to see if the channel has been closed.
         if self.channel.senders.load(Ordering::SeqCst) == 0 &&
-           self.channel.next.get(Ordering::SeqCst).is_none() {
+           self.channel.next.get().is_none() {
             return false;
         }
 
