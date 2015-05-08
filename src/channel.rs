@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::mem;
 use alloc::arc::get_mut;
@@ -17,6 +17,8 @@ pub enum ReceiverError {
 
 struct Block<T> {
     next: AtomSetOnce<Arc<Block<T>>>,
+    pulse: Atom<Pulse>,
+    signal: AtomSetOnce<Signal>,
     data: Box<[T]>
 }
 
@@ -40,6 +42,8 @@ impl<T: Send+Sync> Block<T> {
     fn new(data: Box<[T]>) -> Block<T> {
         Block {
             next: AtomSetOnce::empty(),
+            pulse: Atom::empty(),
+            signal: AtomSetOnce::empty(),
             data: data
         }
     }
@@ -52,7 +56,6 @@ impl<T: Send+Sync> Block<T> {
 
 struct WritePtr<T> {
     current: Arc<Block<T>>,
-    offset: usize
 }
 
 impl<'a, T: Send+Sync> WritePtr<T> {
@@ -60,7 +63,6 @@ impl<'a, T: Send+Sync> WritePtr<T> {
     fn from_block(block: Arc<Block<T>>) -> WritePtr<T> {
         WritePtr {
             current: block,
-            offset: 0
         }
     }
 
@@ -77,11 +79,7 @@ impl<'a, T: Send+Sync> WritePtr<T> {
     /// Get the next WritePtr, return None if this is the current tail
     fn next(&self) -> Option<WritePtr<T>> {
         self.current.next.dup().map(|next| {
-            let len = next.data.len();
-            WritePtr {
-                current: next,
-                offset: self.offset + len
-            }
+            WritePtr { current: next }
         })
     }
 
@@ -100,21 +98,28 @@ impl<'a, T: Send+Sync> WritePtr<T> {
     /// fails try again until it is written successfully.
     ///
     /// This returns the WritePtr of that block.
-    fn append(&mut self, mut b: Arc<Block<T>>) -> usize {
+    fn append(&mut self, mut b: Arc<Block<T>>) {
         loop {
-            let len = b.data.len();
             self.tail();
             b = match self.write(b) {
                 Some(b) => b,
-                None => return self.offset + len
+                None => {
+                    if let Some(pulse) = self.current.pulse.take() {
+                        pulse.pulse();
+                    }
+                    return;
+                }
             };
         }
     }
-}
 
-struct Waiting {
-    index: usize,
-    trigger: Pulse
+    /// Seek the tail and wait any waiter
+    fn force_wake(&mut self) {
+        self.tail();
+        if let Some(pulse) = self.current.pulse.take() {
+            pulse.pulse();
+        }
+    }
 }
 
 struct ChannelNext<T>(Arc<Channel<T>>, Arc<Block<T>>);
@@ -126,125 +131,21 @@ struct Channel<T> {
     // Keeps track of the numbe of senders, when it reaches
     // 0 it indicates that we are at the end of the frame.
     senders: AtomicUsize,
-
-    // This is eventually consistent value used for the writes
-    // If the count is greater then the value a writer just appended
-    // the write does not need to enter the wake anyone.
-    count: AtomicUsize,
-    waiters: Mutex<Vec<Waiting>>
 }
 
 impl<T: Send+Sync> Channel<T> {
     fn new(senders: usize) -> (Arc<Channel<T>>, Arc<Block<T>>) {
         let next = Arc::new(Channel {
             next: AtomSetOnce::empty(),
-            count: AtomicUsize::new(0),
-            senders: AtomicUsize::new(senders),
-            waiters: Mutex::new(Vec::new())
+            senders: AtomicUsize::new(senders)
         });
 
         let head = Arc::new(Block::new(Vec::new().into_boxed_slice()));
         (next, head)
     }
 
-    fn add_to_waitlist(&self, index: usize, trigger: Pulse) {
-        let start = self.count.load(Ordering::SeqCst);
-        if start > index {
-            trigger.pulse();
-            return;
-        }
-
-        {
-            let mut guard = self.waiters.lock().unwrap();
-            guard.push(Waiting{
-                index: index,
-                trigger: trigger
-            });
-        }
-
-        // since we locked the waiters, it is possible
-        // a writer came in and missed a wake up. It's our
-        // job to see if that happened
-        let end = self.count.load(Ordering::SeqCst);
-        let force = self.senders.load(Ordering::SeqCst) == 0;
-        if force {
-            self.force_wake();
-        } else if start != end  {
-            self.wake_waiter(end);
-        }
-    }
-
-    fn force_wake(&self) -> usize {
-        let mut guard = self.waiters.lock().unwrap();
-        let woke = guard.len();
-        while let Some(w) = guard.pop() {
-            w.trigger.pulse();
-        }
-        woke
-    }
-
-    fn wake_waiter(&self, mut count: usize) -> usize {
-        let mut woke = 0;
-        loop {
-            match self.waiters.try_lock() {
-                Ok(mut waiting) => {
-                    // wake up only the items that are behind us
-                    // swap_remove lets us remove these without
-                    // to much overhead.
-                    let mut i = 0;
-                    while i < waiting.len() {
-                        if waiting[i].index < count {
-                            woke += 1;
-                            waiting.swap_remove(i).trigger.pulse();
-                        } else {
-                            i += 1;
-                        }
-                    }
-                },
-                // someone else waking people up, they lose and
-                // will have to also wake up anyone our payload just
-                // woke up.
-                Err(_) => return woke
-            }
-
-            // the lock is released now, we have to check if someone
-            // hit the Error case above and bailed, if they did
-            // we have to do their job for them.
-            let current = self.count.load(Ordering::SeqCst);
-            if current == count {
-                return woke;
-            } else {
-                count = current;
-            }
-        }
-    }
-
-    fn advance_count(&self, mut from: usize, to: usize) -> usize {
-        loop {
-            let count = self.count.compare_and_swap(from, to, Ordering::SeqCst);
-
-            // if the count is greater then what we are moving it to
-            // it means we lost the race and need to give up
-            if count > to {
-                return 0;
-
-            // If the value read was still not the value we expected it means
-            // someone has fallen behind. We move out from to their from.
-            // There is a case where we try and update the from, jump back to do
-            // work meanwhile some does work for us. In that case
-            } else if count != from {
-                from = count;
-                continue
-
-            // we won the race and did the correct update
-            } else {
-                return self.wake_waiter(to);
-            }
-        }
-    }
-
     fn next(&self) -> &ChannelNext<T> {
-        if self.next.get().is_none() {
+        if self.next.is_none() {
             let (next, head) = Channel::new(0);
             self.next.set_if_none(Box::new(ChannelNext(next, head)));
         }
@@ -287,29 +188,27 @@ impl<T: Send+Sync> Sender<T> {
         let mut buffer = Vec::with_capacity(sender_size::<T>());
         mem::swap(&mut buffer, &mut self.buffer);
         let block = Arc::new(Block::new(buffer.into_boxed_slice()));
-        let to = self.write.append(block);
-        let from = self.write.offset;
-
-        self.channel.advance_count(from, to);
+        self.write.append(block);
     }
 
     pub fn next_frame(&mut self) {
+        use std::mem;
         self.flush();
 
-        let (channel, block) = {
+        let (mut channel, block) = {
             let &ChannelNext(ref ch, ref block) = self.channel.next();
             (ch.clone(), block.clone())
         };
 
         channel.senders.fetch_add(1, Ordering::SeqCst);
  
-        let old = self.channel.clone();
-        self.channel = channel;
-        self.write = WritePtr::from_block(block);
+        let mut write = WritePtr::from_block(block);
+        mem::swap(&mut write, &mut self.write);
+        mem::swap(&mut self.channel, &mut channel);
 
-        let last = old.senders.fetch_sub(1, Ordering::SeqCst);
+        let last = channel.senders.fetch_sub(1, Ordering::SeqCst);
         if last == 1 {
-            old.force_wake();
+            write.force_wake();
         }
     }
 
@@ -325,7 +224,6 @@ impl<T: Sync+Send> Clone for Sender<T> {
             buffer: Vec::with_capacity(sender_size::<T>()),
             write: WritePtr {
                 current: self.write.current.clone(),
-                offset: self.write.offset
             }
         }
     }
@@ -338,7 +236,7 @@ impl<T: Send+Sync> Drop for Sender<T> {
 
         let last = self.channel.senders.fetch_sub(1, Ordering::SeqCst);
         if last == 1 {
-            self.channel.force_wake();
+            self.write.force_wake();
         }
     }
 }
@@ -394,6 +292,7 @@ impl<T: Send+Sync> Receiver<T> {
         self.channel.senders.load(Ordering::SeqCst) == 0
     }
 
+    #[inline]
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
         loop {
             if !self.pending() {
@@ -403,7 +302,7 @@ impl<T: Send+Sync> Receiver<T> {
             }
 
             match (self.channel.senders.load(Ordering::SeqCst) == 0,
-                   self.channel.next.get().is_none(),
+                   self.channel.next.is_none(),
                    self.pending()) {
                 (_,    _,     true)  => break,
                 (true, true,  false) => return Err(ReceiverError::ChannelClosed),
@@ -417,18 +316,27 @@ impl<T: Send+Sync> Receiver<T> {
     }
 
     pub fn signal(&self) -> Signal {
-        let (signal, pulse) = Signal::new();
-        self.channel.add_to_waitlist(
-            self.offset + self.index,
-            pulse
-        );
-        signal
+        if let Some(signal) = self.current.signal.dup() {
+            return signal;
+        } else {
+            let (signal, pulse) = Signal::new();
+            if self.current.signal.set_if_none(signal).is_none() {
+                self.current.pulse.swap(pulse);
+
+                if self.current.next.get().is_some() ||
+                   self.channel.senders.load(Ordering::SeqCst) == 0 {
+                    self.current.pulse.take().map(|p| p.pulse());
+                }
+            }
+        }
+
+        self.current.signal.dup().unwrap()
     }
 
     pub fn next_frame(&mut self) -> bool {
         // checkc to see if the channel has been closed.
         if self.channel.senders.load(Ordering::SeqCst) == 0 &&
-           self.channel.next.get().is_none() {
+           self.channel.next.is_none() {
             return false;
         }
 

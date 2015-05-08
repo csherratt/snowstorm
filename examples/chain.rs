@@ -5,7 +5,7 @@ use snowstorm::channel::*;
 use std::thread;
 use time::precise_time_s;
 
-const THREADS: usize = 16;
+const THREADS: usize = 12;
 const FRAMES: usize = 10;
 const ITEMS: usize = 10000000;
 
