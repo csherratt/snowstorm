@@ -264,11 +264,11 @@ pub struct Sender<T: Send+Sync> {
 fn sender_size<T>() -> usize {
     let size = mem::size_of::<T>();
     if size == 0 {
-        8192
-    } else if size >= 8192 {
+        2048
+    } else if size >= 2048 {
         1
     } else {
-        8192 / size
+        2048 / size
     }
 }
 
@@ -387,6 +387,11 @@ impl<T: Send+Sync> Receiver<T> {
         } else {
             true
         }
+    }
+
+    /// Check to see if the channel has closed
+    pub fn closed(&self) -> bool {
+        self.channel.senders.load(Ordering::SeqCst) == 0
     }
 
     pub fn recv<'a>(&'a mut self) -> Result<&'a T, ReceiverError> {
