@@ -229,7 +229,6 @@ impl<T: Sync+Send> Clone for Sender<T> {
     }
 }
 
-#[unsafe_destructor]
 impl<T: Send+Sync> Drop for Sender<T> {
     fn drop(&mut self) {
         self.flush();
