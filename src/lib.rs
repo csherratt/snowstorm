@@ -1,4 +1,4 @@
-#![feature(unsafe_destructor, alloc)]
+#![feature(alloc)]
 
 extern crate alloc;
 extern crate atom;
