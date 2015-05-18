@@ -352,6 +352,14 @@ impl<T: Send+Sync> Receiver<T> {
     }
 }
 
+impl<T: Send+Sync+Copy+'static> Receiver<T> {
+    pub fn copy_iter<'a>(&'a mut self) -> CopyIter<'a, T> {
+        CopyIter {
+            inner: self
+        }
+    }
+}
+
 impl<T: Sync+Send> Clone for Receiver<T> {
     fn clone(&self) -> Receiver<T> {
         Receiver {
@@ -360,6 +368,18 @@ impl<T: Sync+Send> Clone for Receiver<T> {
             offset: self.offset,
             index: self.index
         }
+    }
+}
+
+pub struct CopyIter<'a, T:Send+Sync+'static> {
+    inner: &'a mut Receiver<T>
+}
+
+impl<'a, T: Send+Sync+Copy+'static> Iterator for CopyIter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.inner.try_recv().map(|x| *x)
     }
 }
 

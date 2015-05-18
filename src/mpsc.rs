@@ -337,6 +337,14 @@ impl<T: Send+Sync> Receiver<T> {
     }
 }
 
+impl<T: Send+Sync+Copy+'static> Receiver<T> {
+    pub fn iter<'a>(&'a mut self) -> Iter<'a, T> {
+        Iter {
+            inner: self
+        }
+    }
+}
+
 pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
     let (channel, head) = Channel::new(1);
 
@@ -355,3 +363,16 @@ pub fn channel<T: Send+Sync>() -> (Sender<T>, Receiver<T>) {
 
     (tx, rx)
 }
+
+pub struct Iter<'a, T:Send+Sync+'static> {
+    inner: &'a mut Receiver<T>
+}
+
+impl<'a, T: Send+Sync+Copy+'static> Iterator for Iter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.inner.try_recv()
+    }
+}
+
