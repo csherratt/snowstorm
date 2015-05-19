@@ -337,11 +337,9 @@ impl<T: Send+Sync> Receiver<T> {
     }
 }
 
-impl<T: Send+Sync+Copy+'static> Receiver<T> {
+impl<T: Send+Sync+'static> Receiver<T> {
     pub fn iter<'a>(&'a mut self) -> Iter<'a, T> {
-        Iter {
-            inner: self
-        }
+        Iter { inner: self }
     }
 }
 
@@ -368,7 +366,7 @@ pub struct Iter<'a, T:Send+Sync+'static> {
     inner: &'a mut Receiver<T>
 }
 
-impl<'a, T: Send+Sync+Copy+'static> Iterator for Iter<'a, T> {
+impl<'a, T: Send+Sync+'static> Iterator for Iter<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
