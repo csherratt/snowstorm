@@ -353,9 +353,10 @@ impl<T: Send+Sync> Receiver<T> {
 }
 
 impl<T: Send+Sync+Copy+'static> Receiver<T> {
-    pub fn copy_iter<'a>(&'a mut self) -> CopyIter<'a, T> {
+    pub fn copy_iter<'a>(&'a mut self, block: bool) -> CopyIter<'a, T> {
         CopyIter {
-            inner: self
+            inner: self,
+            block: block
         }
     }
 }
@@ -372,14 +373,28 @@ impl<T: Sync+Send> Clone for Receiver<T> {
 }
 
 pub struct CopyIter<'a, T:Send+Sync+'static> {
-    inner: &'a mut Receiver<T>
+    inner: &'a mut Receiver<T>,
+    block: bool
 }
 
 impl<'a, T: Send+Sync+Copy+'static> Iterator for CopyIter<'a, T> {
     type Item = T;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<T> {
-        self.inner.try_recv().map(|x| *x)
+        loop {
+            if let Some(x) = self.inner.try_recv() {
+                return Some(*x);
+            }
+            if self.block {
+                if self.inner.channel.senders.load(Ordering::SeqCst) == 0 {
+                    return None;
+                }
+                self.inner.signal().wait().unwrap();
+            } else {
+                return None;
+            }
+        }
     }
 }
 

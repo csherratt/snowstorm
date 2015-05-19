@@ -53,7 +53,7 @@ fn main() {
         let end = end.clone();
         thread::spawn(move || {
             start.wait();
-            while let Some(_) = r.try_recv() {}
+            for _ in r.copy_iter(false) {}
             end.wait();
         });
     }
@@ -91,7 +91,7 @@ fn main() {
     let e = end.clone();
     thread::spawn(move || {
         let mut count = 0;
-        while let Ok(_) = recv.recv() {
+        for _ in recv.copy_iter(true) {
             count += 1;
             if count == TOTAL_MESSAGES {
                 break;

@@ -7,27 +7,24 @@ use time::precise_time_s;
 
 const THREADS: usize = 12;
 const FRAMES: usize = 10;
-const ITEMS: usize = 10000000;
+const ITEMS: usize = 40000000;
 
 fn worker(mut input: Receiver<(f64, f64)>, mut output: Sender<(f64, f64)>) {
 	loop {
-		match input.recv() {
-			Ok(&(k, v)) => {
-				output.send((k, v + v));
-			}
-			Err(ReceiverError::EndOfFrame) => {
-				input.next_frame();
-				output.next_frame();
-			}
-			Err(ReceiverError::ChannelClosed) => {
-				return;
-			}
+		for (k, v) in input.copy_iter(true) {
+			output.send((k, v + v));
+		}
+
+		if input.next_frame() {
+			output.next_frame();
+		} else {
+			return;
 		}
 	}
 }
 
 fn main() {
-	let (mut tx, mut rx) = channel();	
+	let (mut tx, mut rx) = channel();
 	for _ in 0..THREADS {
 		let (t, r) = channel();
 		thread::spawn(move || {
