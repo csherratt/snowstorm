@@ -272,7 +272,8 @@ impl<T: Send+Sync> Receiver<T> {
 
     /// Check to see if the channel has closed
     pub fn closed(&self) -> bool {
-        self.channel.senders.load(Ordering::SeqCst) == 0
+        self.channel.senders.load(Ordering::SeqCst) == 0 &&
+        self.current.next.is_none()
     }
 
     #[inline]
@@ -319,7 +320,7 @@ impl<T: Send+Sync> Receiver<T> {
     }
 
     pub fn next_frame(&mut self) -> bool {
-        // checkc to see if the channel has been closed.
+        // check to see if the channel has been closed.
         if self.channel.senders.load(Ordering::SeqCst) == 0 &&
            self.channel.next.is_none() {
             return false;

@@ -288,7 +288,8 @@ impl<T: Send+Sync> Receiver<T> {
 
     /// Check to see if the channel has closed
     pub fn closed(&self) -> bool {
-        self.channel.senders.load(Ordering::SeqCst) == 0
+        self.channel.senders.load(Ordering::SeqCst) == 0 &&
+        self.current.next.is_none()
     }
 
     #[inline]
